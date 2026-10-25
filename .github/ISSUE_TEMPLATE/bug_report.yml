@@ -8,6 +8,14 @@ body:
       value: |
         Review the [known limitations](https://github.com/kittycache9/OpenSA2/blob/main/docs/status.md) first. This repository is an experimental source preview.
         Share text diagnostics and reproduction steps. Do not attach game files, generated game code, or captures that contain game data. Remove personal paths and identifiers from logs.
+  - type: checkboxes
+    id: owns_game
+    attributes:
+      label: Game ownership
+      description: OpenSA2 needs your own copy of the 2012 PC release of Sonic Adventure 2, as Steam sells and installs it.
+      options:
+        - label: I own Sonic Adventure 2 on Steam. I understand that the project does not help with installing a copy I do not own, or a modified, repacked, or downloaded copy.
+          required: true
   - type: dropdown
     id: platform
     attributes:
