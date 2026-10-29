@@ -52,9 +52,10 @@ constexpr uint32_t kBorderSpace = 8u;
 
 // d9g_shader_abi.cpp: the SDL ABI pass on a deserialized IR: spec constants and push data into the
 // state buffer (its sub-dword members as 32-bit words with state_words, ShaderProfile::state_words),
-// the dynamic constant buffer capped at SDL's window. Returns false with error set.
+// the dynamic constant buffer capped at SDL's window. With spec (kSpecDwords words), each read of a
+// spec dword is that word, a constant (build's specialized modules). Returns false with error set.
 bool lower_sdl_abi(dxbc_spv::ir::Builder& builder, Stage stage, bool state_words, std::string& error,
-                   bool& capped_dynamic);
+                   bool& capped_dynamic, const uint32_t* spec = nullptr);
 
 // d9g_shader_link.cpp: DxvkIrShader::getCode's linkage step (dxvk_shader_ir.cpp:2033-2075) on the
 // pixel shader's IR against the vertex shader's outputs. Sets io_rewritten when DXVK's

@@ -209,6 +209,9 @@ struct Reflection {
   uint32_t depth_compare_registers = 0;
   uint32_t gather_registers = 0;
   ConstantFacts constant_facts;
+  // Bit i: the module declares spec constant i, D3D9SpecData's dword i: the words a build with
+  // spec values (build's `spec`) makes constants, and the words the device keys that build on.
+  uint32_t spec_ids = 0;
 };
 
 struct Translated {
@@ -264,7 +267,11 @@ struct Built {
 // claim covers reported refusals only. disassemble: fill ir_text (the device never asks for it).
 Translated translate(const void* bytecode, size_t bytes, const ShaderProfile& profile, const Variant& variant,
                      bool disassemble = false);
-Built build(const Translated& shader, const ShaderProfile& profile, const Linkage* linkage);
+// spec: null for the module DXVK's pipeline library builds (every spec constant read from the state
+// buffer), or kSpecDwords words: each spec constant the module declares (Reflection::spec_ids)
+// becomes that word, a constant, as DXVK's optimized pipelines specialize theirs.
+Built build(const Translated& shader, const ShaderProfile& profile, const Linkage* linkage,
+            const uint32_t* spec = nullptr);
 
 // The vk11 profile's lowering (ShaderProfile::vk11; d9g_shader_abi.cpp), which build() runs on each
 // module it builds with that profile. dxbc-spirv builds SPIR-V 1.6 with PhysicalStorageBuffer64 and

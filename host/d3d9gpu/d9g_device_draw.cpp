@@ -346,6 +346,36 @@ draw::Prepared Device::prepare_draw(uint32_t method, uint32_t prim, uint32_t str
     }
     if (!reasons.empty()) return Unmapped{std::move(reasons)};
     variants.pixel.sampler_modes = shader::sampler_modes_word(modes, ps_base.sampler_mode_slots);
+    // The spec words before the program, whose pixel shader is built specialized at the ones it
+    // declares. The BOOL masks and the version they read are the shaders' own, so the base
+    // translations' reflections give what the selected program's would.
+    ConstantBank vb{vs_f_.data(), uint32_t(vs_f_.size()), vs_i_.data(), uint32_t(vs_i_.size()),
+        vs_b_.data(), uint32_t(vs_b_.size()), changed_float_count_};
+    ConstantBank pb{ps_f_.data(), uint32_t(ps_f_.size()), ps_i_.data(), uint32_t(ps_i_.size()),
+        ps_b_.data(), uint32_t(ps_b_.size()), 0};
+    const ClipPlanes planes = pack_clip_planes(clip_, rs_[D3DRS_CLIPPLANEENABLE]);
+    // On a device without shaderClipDistance no vertex module writes ClipDistance
+    // (ShaderProfile::no_clip_distance), so a draw with a user clip plane enabled would draw what the
+    // plane clips: it is refused by name. SA2 enables none (the streams' scans).
+    if (planes.count && shader_profile_.no_clip_distance)
+        return Unmapped{{"USER_CLIP_PLANES without shaderClipDistance"}};
+    SpecFacts spec;
+    spec.legacy = legacy;
+    spec.clip_plane_count = planes.count;
+    spec.fog_enabled = rs_[D3DRS_FOGENABLE] != 0;
+    spec.fog_vertex_mode = uint8_t(rs_[D3DRS_FOGVERTEXMODE]);
+    spec.fog_pixel_mode = uint8_t(rs_[D3DRS_FOGTABLEMODE]);
+    spec.global_specular = rs_[D3DRS_SPECULARENABLE] != 0;
+    for (uint32_t r = 0; r < 8; r++)
+        if (tex_[r] && ((ps_base.sampler_mask >> r) & 1u) &&
+            (tss_[r][D3DTSS_TEXTURETRANSFORMFLAGS - 1] & D3DTTFF_PROJECTED)) spec.sampler_projection_mask |= uint8_t(1u << r);
+    spec.vs_sampler_types = vs_types; spec.vs_sampler_modes = vs_modes;
+    spec.ps_sampler_types = ps_types; spec.ps_sampler_modes = ps_modes;
+    const auto spec_result = pack_spec_words(spec, vs_base, ps_base, vb, pb);
+    if (const auto* u = std::get_if<Unmapped>(&spec_result)) return *u;
+    const SpecWords spec_words = std::get<SpecWords>(spec_result);
+    for (uint32_t i = 0; i < shader::kSpecDwords; ++i)
+        if ((ps_base.spec_ids >> i) & 1u) variants.pixel_spec[i] = spec_words[i];
     auto program = programs_.for_draw({vs_->tokens(), vs_->translated(), vs_->program_source_id()},
                                      {ps_->tokens(), ps_->translated(), ps_->program_source_id()},
                                      shader_profile_, variants);
@@ -399,32 +429,8 @@ draw::Prepared Device::prepare_draw(uint32_t method, uint32_t prim, uint32_t str
         if (!reasons.empty()) return Unmapped{std::move(reasons)};
         return Failure{"bind sampled texture", gpu_->error()};
     }
-    ConstantBank vb{vs_f_.data(), uint32_t(vs_f_.size()), vs_i_.data(), uint32_t(vs_i_.size()),
-        vs_b_.data(), uint32_t(vs_b_.size()), changed_float_count_};
-    ConstantBank pb{ps_f_.data(), uint32_t(ps_f_.size()), ps_i_.data(), uint32_t(ps_i_.size()),
-        ps_b_.data(), uint32_t(ps_b_.size()), 0};
-    const ClipPlanes planes = pack_clip_planes(clip_, rs_[D3DRS_CLIPPLANEENABLE]);
-    // On a device without shaderClipDistance no vertex module writes ClipDistance
-    // (ShaderProfile::no_clip_distance), so a draw with a user clip plane enabled would draw what the
-    // plane clips: it is refused by name. SA2 enables none (the streams' scans).
-    if (planes.count && shader_profile_.no_clip_distance)
-        return Unmapped{{"USER_CLIP_PLANES without shaderClipDistance"}};
-    SpecFacts spec;
-    spec.legacy = legacy;
-    spec.clip_plane_count = planes.count;
-    spec.fog_enabled = rs_[D3DRS_FOGENABLE] != 0;
-    spec.fog_vertex_mode = uint8_t(rs_[D3DRS_FOGVERTEXMODE]);
-    spec.fog_pixel_mode = uint8_t(rs_[D3DRS_FOGTABLEMODE]);
-    spec.global_specular = rs_[D3DRS_SPECULARENABLE] != 0;
-    for (uint32_t r = 0; r < 8; r++)
-        if (tex_[r] && ((ps_base.sampler_mask >> r) & 1u) &&
-            (tss_[r][D3DTSS_TEXTURETRANSFORMFLAGS - 1] & D3DTTFF_PROJECTED)) spec.sampler_projection_mask |= uint8_t(1u << r);
-    spec.vs_sampler_types = vs_types; spec.vs_sampler_modes = vs_modes;
-    spec.ps_sampler_types = ps_types; spec.ps_sampler_modes = ps_modes;
-    const auto spec_result = pack_spec_words(spec, v.program->vertex_reflection, v.program->pixel_reflection, vb, pb);
-    if (const auto* u = std::get_if<Unmapped>(&spec_result)) return *u;
     UniformInputs uniforms;
-    uniforms.spec = std::get<SpecWords>(spec_result);
+    uniforms.spec = spec_words;
     uniforms.shared = shared_push_;
     uniforms.shared.alpha_reference = spec.legacy.alpha_ref;
     uniforms.legacy = spec.legacy;

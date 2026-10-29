@@ -1034,6 +1034,13 @@ Translated translate(const void* bytecode, size_t bytes, const ShaderProfile& pr
         r.flat_shading_inputs |= analysis.GetFlatShadingMask() & (1u << uint32_t(it->getOperand(it->getFirstLiteralOperandIndex())));
     }
   }
+  for (auto it = builder.getDeclarations().first; it != builder.getDeclarations().second; ++it) {
+    if (it->getOpCode() == ir::OpCode::eDclSpecConstant) {
+      const uint32_t id = uint32_t(it->getOperand(it->getFirstLiteralOperandIndex()));
+      if (id < kSpecDwords)
+        r.spec_ids |= 1u << id;
+    }
+  }
 
   ir::Serializer serializer(builder);
   t.ir.resize(serializer.computeSerializedSize());

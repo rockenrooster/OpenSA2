@@ -263,7 +263,8 @@ bool deserialize(const std::vector<uint8_t>& ir, ir::Builder& builder) {
   return deserializer.deserialize(builder);
 }
 
-bool lower_sdl_abi(ir::Builder& b, Stage stage, bool state_words, std::string& error, bool& capped_dynamic) {
+bool lower_sdl_abi(ir::Builder& b, Stage stage, bool state_words, std::string& error, bool& capped_dynamic,
+                   const uint32_t* spec) {
   auto entry = find_entry_point(b);
   if (!entry) {
     error = "no entry point";
@@ -297,6 +298,39 @@ bool lower_sdl_abi(ir::Builder& b, Stage stage, bool state_words, std::string& e
   if (!state || b.getOp(state).getType().getStructMemberCount() != kSpecDwords) {
     error = "lowerSpecConstantsToCbv did not build the seven-dword state prefix";
     return false;
+  }
+  // A specialized build: every load lowerSpecConstantsToCbv made of a spec dword (each a BufferLoad
+  // of member 0-6 through a DescriptorLoad of the state buffer, the only loads of it so far) becomes
+  // the draw's word, a constant, so the driver folds what the word decides (the alpha test, fog,
+  // sampler projection, BOOL constants...) instead of every pixel loading it and branching. The
+  // state buffer stays declared, its layout as before, for the push data below.
+  if (spec) {
+    util::small_vector<ir::SsaDef, 64u> descriptors;
+    b.getUses(state, descriptors);
+    for (auto d : descriptors) {
+      if (b.getOp(d).getOpCode() != ir::OpCode::eDescriptorLoad)
+        continue;
+      util::small_vector<ir::SsaDef, 64u> loads;
+      b.getUses(d, loads);
+      for (auto l : loads) {
+        const ir::Op& load = b.getOp(l);
+        if (load.getOpCode() != ir::OpCode::eBufferLoad)
+          continue;
+        const auto& address = b.getOpForOperand(load, 1u);
+        if (!address || !address.isConstant() || address.getOperandCount() != 1u ||
+            uint32_t(address.getOperand(0u)) >= kSpecDwords || !load.getType().isScalarType() ||
+            load.getType().getBaseType(0u).getBaseType() != ir::ScalarType::eU32) {
+          error = "a spec dword load that is not one whole u32 member";
+          return false;
+        }
+        const uint32_t word = spec[uint32_t(address.getOperand(0u))];
+        b.rewriteDef(l, b.makeConstant(word));
+      }
+      util::small_vector<ir::SsaDef, 4u> rest;
+      b.getUses(d, rest);
+      if (rest.empty())
+        b.remove(d);
+    }
   }
 
   // Push data: append DXVK's push blocks to the state buffer's type, then turn every PushDataLoad
@@ -391,7 +425,7 @@ bool lower_sdl_abi(ir::Builder& b, Stage stage, bool state_words, std::string& e
   return true;
 }
 
-Built build(const Translated& shader, const ShaderProfile& profile, const Linkage* linkage) {
+Built build(const Translated& shader, const ShaderProfile& profile, const Linkage* linkage, const uint32_t* spec) {
   Built out;
   FpEnvGuard env;
   CapturingLogger logger;
@@ -427,7 +461,7 @@ Built build(const Translated& shader, const ShaderProfile& profile, const Linkag
     out.linked = true;
   }
   bool capped = false;
-  if (!lower_sdl_abi(b, shader.stage, profile.state_words, out.error, capped))
+  if (!lower_sdl_abi(b, shader.stage, profile.state_words, out.error, capped, spec))
     return out;
   Fault fault = active_fault(out.error);
   if (!out.error.empty())

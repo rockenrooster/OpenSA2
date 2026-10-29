@@ -34,6 +34,9 @@ struct SelectedVariants {
     shader::Variant vertex, pixel;
     bool flat_shading;
     uint32_t target_swizzle_mask;
+    // The draw's spec words (pack_spec_words) where the pixel shader's module declares the spec
+    // constant (Reflection::spec_ids), zero elsewhere: its build makes them constants.
+    std::array<uint32_t, shader::kSpecDwords> pixel_spec{};
 };
 struct ShaderSource {
     const std::vector<uint32_t>& tokens;

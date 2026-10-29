@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -75,7 +76,7 @@ namespace {
 // Equal keys are equal identities: each id is interned from exact content.
 static_assert(sizeof(shader::Variant) == 20, "a new shader::Variant field must join ProgramKey");
 struct ProgramKey {
-    std::array<uint32_t, 13> w{};
+    std::array<uint32_t, 13 + shader::kSpecDwords> w{};
     bool operator==(const ProgramKey& o) const { return same_bytes(w.data(), o.w.data(), sizeof w); }
 };
 struct ProgramKeyHash {
@@ -148,6 +149,7 @@ ProgramResult ProgramImages::for_draw(const ShaderSource& vs_source, const Shade
     variant_words(variants.pixel, &identity.w[7]);
     identity.w[11] = variants.flat_shading;
     identity.w[12] = variants.target_swizzle_mask;
+    for (uint32_t i = 0; i < shader::kSpecDwords; ++i) identity.w[13 + i] = variants.pixel_spec[i];
     auto hit = impl_->images.find(identity);
     if (hit != impl_->images.end()) return hit->second;
     const std::string& profile_text = impl_->profile_text;
@@ -168,7 +170,21 @@ ProgramResult ProgramImages::for_draw(const ShaderSource& vs_source, const Shade
     image->vertex = shader::build(vertex, profile, nullptr);
     if (!image->vertex.ok) return program_error("build vertex shader", image->vertex.error);
     shader::Linkage linkage{&vertex, variants.flat_shading, variants.target_swizzle_mask};
-    image->pixel = shader::build(pixel, profile, &linkage);
+    // The pixel shader specialized at its spec words: the work per pixel is the work per vertex
+    // times the scene's overdraw, and a phone's GPU spends most of a frame there. The vertex shader
+    // keeps reading its words from the state buffer, so its variants stay as many as before.
+    image->pixel = shader::build(pixel, profile, &linkage, variants.pixel_spec.data());
+    // A specialization the translator refuses is built unspecialized, as before, and said once: the
+    // draw still draws, and the image, cached under this key, is not built again at the next draw.
+    if (!image->pixel.ok) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "d3d9gpu: a pixel shader could not be specialized (%s): built unspecialized\n",
+                         image->pixel.error.c_str());
+        }
+        image->pixel = shader::build(pixel, profile, &linkage);
+    }
     if (!image->pixel.ok) return program_error("build pixel shader", image->pixel.error);
     image->vertex_reflection = vertex.reflection;
     image->pixel_reflection = pixel.reflection;
