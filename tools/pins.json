@@ -97,9 +97,13 @@
         {
           "path": "patches/sdl3/0001-gpu-clamp-to-border-and-depth-clamp-with-clip.patch",
           "sha256": "653660ac0b15698fbed86c3deee6bdc032aa03ecf864f25377ddb2122c9e8734"
+        },
+        {
+          "path": "patches/sdl3/0002-gpu-vulkan-pipeline-cache.patch",
+          "sha256": "2eadec5e98fe4a47930496230f4aa50d1a7810d6ccf71439b49556f0e40db146"
         }
       ],
-      "vendor_info": "sa2-recomp sdl3-patches f7d5f0abeaa4",
+      "vendor_info": "sa2-recomp sdl3-patches 41afe8badc38",
       "use": "S5's platform layer and DXVK Native's window system, built by tools/s5/build_host_deps.sh in its patched configuration (the default): the pinned tarball, which records \"commit\" in its .git-hash, with the project's own patches (\"patches\", under patches/sdl3: border addressing and depth clamp; not from the SDL project, and nothing is submitted to SDL, per the user's second rulings of 2026-10-04, Documentation/decisions/2026-10-04-S5-user-rulings-2.md) applied strictly, and SDL_VENDOR_INFO \"vendor_info\", the patches' identity, so the library's revision is marked as altered (zlib licence, clause 2). The stock build is sdl3-stock. \"library\" is libSDL3.so.0, the name DXVK dlopens (src/wsi/sdl3/wsi_platform_sdl3.cpp) and SDL3's SONAME; the gate hashes the file it reaches. X screensaver and XTest are configured off, because SDL's configure refuses them without their development packages, which are absent. Dynamic ALSA uses freshly extracted pinned Debian headers and the pinned installed libasound.so.2. PulseAudio, PipeWire, JACK and sndio are explicitly off. Off for want of development packages: libdecor (window decorations under Wayland on GNOME and Weston), D-Bus, IBus, libudev, KMSDRM, liburing and HIDAPI's libusb. The SDL source was downloaded under the user's approval of 2026-09-29 (Documentation/decisions/2026-09-29-S5-host-downloads.md); the ALSA headers package, fetched from deb.debian.org on 2026-10-01 outside that approval, was ratified by the user on 2026-10-02 (Documentation/decisions/2026-10-02-S5-alsa-headers-download.md)",
       "alsa_headers": {
         "path": "private/s5-tools/dl/libasound2-dev_1.2.14-1+deb13u1_amd64.deb",

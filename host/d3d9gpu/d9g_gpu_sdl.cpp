@@ -1845,6 +1845,11 @@ SDL_GPUDevice* create_device(bool debug, shader::VulkanFeatures& features, const
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, false);
     if (hardware_only)
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_REQUIRE_HARDWARE_ACCELERATION_BOOLEAN, true);
+    // SA2_D3D9GPU_PIPELINE_CACHE=<file>: the Vulkan pipeline cache's file (patches/sdl3 0002), so a
+    // session's pipelines are compiled once and the next session finds them there. A stock SDL
+    // ignores the property.
+    if (const char* cache = std::getenv("SA2_D3D9GPU_PIPELINE_CACHE"); cache && *cache)
+        SDL_SetStringProperty(props, "SDL.gpu.device.create.sa2recomp.pipeline_cache_path", cache);
     if (first) {
         r.x87_before = x87_cw();
         r.mxcsr_before = mxcsr();

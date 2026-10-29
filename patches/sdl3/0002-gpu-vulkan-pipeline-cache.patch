@@ -1,0 +1,207 @@
+sa2-recomp local patch 0002 to SDL 3.4.16: a Vulkan pipeline cache kept in a file
+
+    NOT FROM THE SDL PROJECT. This patch belongs to the SA2 Recompiled
+    project and was written for it by an AI agent (Claude). It is not
+    submitted to SDL and is not meant for submission, like patch 0001.
+
+    Target: SDL release 3.4.16 (tag release-3.4.16), commit
+    fa2c02bb6e21974a89ea9824bc53c9932abe5f9c, the commit the release
+    tarball records in its own .git-hash file. The tarball is
+    SDL3-3.4.16.tar.gz, sha256
+    7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68.
+    It applies on top of 0001-gpu-clamp-to-border-and-depth-clamp-with-clip.patch.
+
+    What it changes: the Vulkan backend made every pipeline without a
+    VkPipelineCache (SDL's own "TODO: enable pipeline caching"), so a
+    process compiled each pipeline from scratch, every run. On a Moto One
+    5G Ace (Adreno 619) the player made 66 pipelines a session in City
+    Escape, 3.7 s of driver compile on its render thread.
+
+    - SDL_PROP_GPU_DEVICE_CREATE_SA2RECOMP_PIPELINE_CACHE_PATH_STRING
+      ("SDL.gpu.device.create.sa2recomp.pipeline_cache_path"), given to
+      SDL_CreateGPUDeviceWithProperties, names a file. The Vulkan device
+      seeds a VkPipelineCache from it (the driver checks the data's header
+      and starts empty on data that is not its own), passes the cache to
+      every graphics and compute pipeline it makes, and writes the cache
+      back, by a temporary file and a rename, after every 16 new graphics
+      pipelines and when the device is destroyed.
+    - Without the property, or when no cache can be made, pipelines are
+      made with VK_NULL_HANDLE as before. Other backends ignore it.
+
+    No struct layout of SDL's API changes and no function is added.
+    Marked as modified as patch 0001 says: the vendor id covers both
+    patches, in file-name order.
+
+    How to apply it: after 0001, strictly, in the top directory of the
+    extracted tarball, with GNU patch in the C locale,
+
+      LC_ALL=C patch -p1 --fuzz=0 --forward --batch < 0002-gpu-vulkan-pipeline-cache.patch
+
+    refusing any hunk placed at an offset (tools/s5/sdl3_patches.py).
+
+   include/SDL3/SDL_gpu.h          |  6 +++
+   src/gpu/vulkan/SDL_gpu_vulkan.c | 90 +++++++++++++++++++++++++++++++--
+   2 files changed, 93 insertions(+), 3 deletions(-)
+
+diff --git a/include/SDL3/SDL_gpu.h b/include/SDL3/SDL_gpu.h
+index a46cf64..7fc7920 100644
+--- a/include/SDL3/SDL_gpu.h
++++ b/include/SDL3/SDL_gpu.h
+@@ -2641,6 +2641,12 @@ extern SDL_DECLSPEC SDL_PropertiesID SDLCALL SDL_GetGPUDeviceProperties(SDL_GPUD
+ #define SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING        "SDL.gpu.device.driver_name"
+ #define SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING     "SDL.gpu.device.driver_version"
+ #define SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING        "SDL.gpu.device.driver_info"
++/* sa2-recomp patch 0002 (not from the SDL project): a file for the Vulkan
++ * pipeline cache, given to SDL_CreateGPUDeviceWithProperties. The device seeds
++ * its VkPipelineCache from the file, passes the cache to every pipeline it
++ * makes, and writes the cache back after every 16 new graphics pipelines and
++ * when the device is destroyed. Other drivers ignore it. */
++#define SDL_PROP_GPU_DEVICE_CREATE_SA2RECOMP_PIPELINE_CACHE_PATH_STRING "SDL.gpu.device.create.sa2recomp.pipeline_cache_path"
+ #define SDL_PROP_GPU_DEVICE_SA2RECOMP_SAMPLER_CLAMP_TO_BORDER_BOOLEAN "SDL.gpu.device.sa2recomp.sampler_clamp_to_border"
+ #define SDL_PROP_GPU_DEVICE_SA2RECOMP_DEPTH_CLIP_AND_CLAMP_BOOLEAN    "SDL.gpu.device.sa2recomp.depth_clip_and_clamp"
+ 
+diff --git a/src/gpu/vulkan/SDL_gpu_vulkan.c b/src/gpu/vulkan/SDL_gpu_vulkan.c
+index ca2a3ea..71aec4d 100644
+--- a/src/gpu/vulkan/SDL_gpu_vulkan.c
++++ b/src/gpu/vulkan/SDL_gpu_vulkan.c
+@@ -1132,6 +1132,11 @@ struct VulkanRenderer
+     VkPhysicalDeviceProperties2KHR physicalDeviceProperties;
+     VkPhysicalDeviceDriverPropertiesKHR physicalDeviceDriverProperties;
+     VkDevice logicalDevice;
++    // sa2-recomp patch 0002: the pipeline cache
++    // (SDL_PROP_GPU_DEVICE_CREATE_SA2RECOMP_PIPELINE_CACHE_PATH_STRING)
++    VkPipelineCache pipelineCache;
++    char *pipelineCachePath;
++    Uint32 pipelinesSinceCacheSave;
+     Uint8 integratedMemoryNotification;
+     Uint8 outOfDeviceLocalMemoryWarning;
+     Uint8 outofBARMemoryWarning;
+@@ -4991,6 +4996,42 @@ static bool VULKAN_INTERNAL_EndCommandBuffer(
+     return true;
+ }
+ 
++// sa2-recomp patch 0002: the pipeline cache's data to its file, by a temporary file and a
++// rename, so a reader never finds half of it. A failure leaves the file as it was.
++static void VULKAN_INTERNAL_SavePipelineCache(VulkanRenderer *renderer)
++{
++    size_t size = 0;
++    void *data;
++    char *tmp = NULL;
++    SDL_IOStream *io;
++
++    renderer->pipelinesSinceCacheSave = 0;
++    if (renderer->pipelineCache == VK_NULL_HANDLE || !renderer->pipelineCachePath) {
++        return;
++    }
++    if (renderer->vkGetPipelineCacheData(renderer->logicalDevice, renderer->pipelineCache, &size, NULL) != VK_SUCCESS || size == 0) {
++        return;
++    }
++    data = SDL_malloc(size);
++    if (!data) {
++        return;
++    }
++    if (renderer->vkGetPipelineCacheData(renderer->logicalDevice, renderer->pipelineCache, &size, data) == VK_SUCCESS &&
++        SDL_asprintf(&tmp, "%s.tmp", renderer->pipelineCachePath) > 0) {
++        io = SDL_IOFromFile(tmp, "wb");
++        if (io) {
++            const bool written = SDL_WriteIO(io, data, size) == size;
++            if (SDL_CloseIO(io) && written) {
++                SDL_RenamePath(tmp, renderer->pipelineCachePath);
++            } else {
++                SDL_RemovePath(tmp);
++            }
++        }
++        SDL_free(tmp);
++    }
++    SDL_free(data);
++}
++
+ static void VULKAN_DestroyDevice(
+     SDL_GPUDevice *device)
+ {
+@@ -4999,6 +5040,15 @@ static void VULKAN_DestroyDevice(
+ 
+     VULKAN_Wait(device->driverData);
+ 
++    // sa2-recomp patch 0002
++    VULKAN_INTERNAL_SavePipelineCache(renderer);
++    if (renderer->pipelineCache != VK_NULL_HANDLE) {
++        renderer->vkDestroyPipelineCache(renderer->logicalDevice, renderer->pipelineCache, NULL);
++        renderer->pipelineCache = VK_NULL_HANDLE;
++    }
++    SDL_free(renderer->pipelineCachePath);
++    renderer->pipelineCachePath = NULL;
++
+     for (Sint32 i = renderer->claimedWindowCount - 1; i >= 0; i -= 1) {
+         VULKAN_ReleaseWindow(device->driverData, renderer->claimedWindows[i]->window);
+     }
+@@ -6654,10 +6704,10 @@ static SDL_GPUGraphicsPipeline *VULKAN_CreateGraphicsPipeline(
+     vkPipelineCreateInfo.basePipelineHandle = VK_NULL_HANDLE;
+     vkPipelineCreateInfo.basePipelineIndex = 0;
+ 
+-    // TODO: enable pipeline caching
++    // sa2-recomp patch 0002: through the pipeline cache (VK_NULL_HANDLE without one)
+     vulkanResult = renderer->vkCreateGraphicsPipelines(
+         renderer->logicalDevice,
+-        VK_NULL_HANDLE,
++        renderer->pipelineCache,
+         1,
+         &vkPipelineCreateInfo,
+         NULL,
+@@ -6677,6 +6727,12 @@ static SDL_GPUGraphicsPipeline *VULKAN_CreateGraphicsPipeline(
+         CHECK_VULKAN_ERROR_AND_RETURN(vulkanResult, vkCreateGraphicsPipelines, NULL);
+     }
+ 
++    // sa2-recomp patch 0002: the cache's file follows new pipelines, 16 at a time, so a process
++    // that ends without SDL_DestroyGPUDevice keeps most of what it compiled
++    if (renderer->pipelineCachePath && ++renderer->pipelinesSinceCacheSave >= 16) {
++        VULKAN_INTERNAL_SavePipelineCache(renderer);
++    }
++
+     SDL_SetAtomicInt(&graphicsPipeline->referenceCount, 0);
+ 
+     if (renderer->debugMode && renderer->supportsDebugUtils && SDL_HasProperty(createinfo->props, SDL_PROP_GPU_GRAPHICSPIPELINE_CREATE_NAME_STRING)) {
+@@ -6792,7 +6848,7 @@ static SDL_GPUComputePipeline *VULKAN_CreateComputePipeline(
+ 
+     vulkanResult = renderer->vkCreateComputePipelines(
+         renderer->logicalDevice,
+-        (VkPipelineCache)VK_NULL_HANDLE,
++        renderer->pipelineCache, // sa2-recomp patch 0002
+         1,
+         &vkShaderCreateInfo,
+         NULL,
+@@ -12997,6 +13053,34 @@ static SDL_GPUDevice *VULKAN_CreateDevice(bool debugMode, bool preferLowPower, S
+         return NULL;
+     }
+ 
++    // sa2-recomp patch 0002: a pipeline cache when the property names its file, seeded from
++    // the file when it reads. The driver checks the data's header (its vendor, device and cache
++    // UUID) and starts empty on data that is not its own; an empty cache is made when even the
++    // seeded one is refused, and none (the stock behaviour) when that fails too.
++    {
++        const char *path = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SA2RECOMP_PIPELINE_CACHE_PATH_STRING, NULL);
++        if (path && *path) {
++            VkPipelineCacheCreateInfo cacheInfo;
++            size_t size = 0;
++            void *initial = SDL_LoadFile(path, &size);
++            SDL_zero(cacheInfo);
++            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++            cacheInfo.initialDataSize = initial ? size : 0;
++            cacheInfo.pInitialData = initial;
++            if (renderer->vkCreatePipelineCache(renderer->logicalDevice, &cacheInfo, NULL, &renderer->pipelineCache) != VK_SUCCESS) {
++                cacheInfo.initialDataSize = 0;
++                cacheInfo.pInitialData = NULL;
++                if (renderer->vkCreatePipelineCache(renderer->logicalDevice, &cacheInfo, NULL, &renderer->pipelineCache) != VK_SUCCESS) {
++                    renderer->pipelineCache = VK_NULL_HANDLE;
++                }
++            }
++            SDL_free(initial);
++            if (renderer->pipelineCache != VK_NULL_HANDLE) {
++                renderer->pipelineCachePath = SDL_strdup(path);
++            }
++        }
++    }
++
+     // CLAMP_TO_BORDER with the three standard border colors is core Vulkan 1.0
+     SDL_SetBooleanProperty(renderer->props, SDL_PROP_GPU_DEVICE_SA2RECOMP_SAMPLER_CLAMP_TO_BORDER_BOOLEAN, true);
+     SDL_SetBooleanProperty(renderer->props, SDL_PROP_GPU_DEVICE_SA2RECOMP_DEPTH_CLIP_AND_CLAMP_BOOLEAN, renderer->supportsDepthClipAndClamp);

@@ -271,6 +271,9 @@ void player_env(const std::string& session) {
                           "SA2_REPLAY_WORDS"}) unsetenv(k);
     setenv("SA2_PLAY_OUT", (session + "/play").c_str(), 1);
     setenv("SA2_D3D9GPU_REPORT", (session + "/d3d9gpu.runrec").c_str(), 1);
+    // The Vulkan pipeline cache's file (patches/sdl3 0002): in <files>, so it outlives the
+    // sessions the app prunes, and a session's pipelines are not compiled again by the next.
+    if (!g_files.empty()) setenv("SA2_D3D9GPU_PIPELINE_CACHE", (g_files + "/vk-pipelines.bin").c_str(), 1);
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 1);
     sa2p::make_dirs(session + "/play");
 }
