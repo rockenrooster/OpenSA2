@@ -502,8 +502,14 @@ void Device::execute_draw(const char* name, uint32_t method, uint32_t prim, uint
     } catch (const std::exception& e) { backend_failure("draw preparation", e.what()); }
       catch (...) { backend_failure("draw preparation", "unknown exception"); }
     count_draw(name, prim, cls);
-    try { note_draw_state(method, prim, stride); }
-    catch (const std::exception& e) { backend_failure("draw state census", e.what()); }
-    catch (...) { backend_failure("draw state census", "unknown exception"); }
+    // The census (the keys file and the report's pipeline counts) is for replays and the state
+    // check. A live session leaves it out (its keys file lists no inputs): it re-derives each changed
+    // draw's pipeline input and interns string keys, 0.85 ms of a frame's render thread on a
+    // Snapdragon 750G in City Escape (player_prof, inclusive).
+    if (!gpu_ || !gpu_->info().live_session) {
+        try { note_draw_state(method, prim, stride); }
+        catch (const std::exception& e) { backend_failure("draw state census", e.what()); }
+        catch (...) { backend_failure("draw state census", "unknown exception"); }
+    }
 }
 }
