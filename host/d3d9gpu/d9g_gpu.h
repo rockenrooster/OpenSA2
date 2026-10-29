@@ -242,6 +242,9 @@ struct GpuCounters {
     uint64_t render_passes = 0, copies = 0, uploads = 0, upload_bytes = 0, downloads = 0, blits = 0;
     // whole clears a draw pass took as a load op, and ones overwritten before anything saw them
     uint64_t clears_folded = 0, clears_dropped = 0;
+    // SDL shaders and pipelines made, and the time SDL_CreateGPUGraphicsPipeline took (the driver's
+    // compile, on the render thread: a hitch at a pipeline's first draw)
+    uint64_t shaders_made = 0, pipelines_made = 0, pipeline_make_ns = 0;
 };
 
 // One texture's bytes as made (every level, face and slice; BC as blocks, D32S8 as 8 bytes a texel):

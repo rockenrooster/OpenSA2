@@ -80,6 +80,28 @@ static_assert(std::string_view(SDL_PROP_GPU_DEVICE_SA2RECOMP_SAMPLER_CLAMP_TO_BO
 static_assert(std::string_view(SDL_PROP_GPU_DEVICE_SA2RECOMP_DEPTH_CLIP_AND_CLAMP_BOOLEAN) == kPropClipAndClamp);
 #endif
 
+bool test_switch(const char* env, const char* prop, const char** which);
+
+// SA2_D3D9GPU_FLAT_PS=1 (on Android debug.sa2.flat_ps=1), a measuring switch: every pixel shader
+// is this one, mid grey to location 0, with the original's sampler and uniform counts so the draws
+// bind as before. The frame time it saves is what the translated pixel shaders cost (their ALU and
+// texture fetches); the picture is wrong. glslc -fshader-stage=frag --target-env=vulkan1.1 -O of
+//   #version 450
+//   layout(location = 0) out vec4 o0;
+//   void main() { o0 = vec4(0.5, 0.5, 0.5, 1.0); }
+constexpr uint32_t kFlatPixelShader[] = {
+    0x07230203, 0x00010300, 0x000d000a, 0x0000000d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x00000009, 0x00030010, 0x00000004,
+    0x00000007, 0x00040047, 0x00000009, 0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006,
+    0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000009,
+    0x00000003, 0x0004002b, 0x00000006, 0x0000000a, 0x3f000000, 0x0004002b, 0x00000006, 0x0000000b,
+    0x3f800000, 0x0007002c, 0x00000007, 0x0000000c, 0x0000000a, 0x0000000a, 0x0000000a, 0x0000000b,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0003003e,
+    0x00000009, 0x0000000c, 0x000100fd, 0x00010038,
+};
+
 class SdlGpu final : public Gpu {
 public:
     // `off`: a test run's capability override (d9g_entry.cpp refuses it outside one), applied
@@ -112,6 +134,21 @@ public:
                 info_.bc_unsupported += std::string(info_.bc_unsupported.empty() ? "" : ", ") + gfmt_name(f);
         SDL_GPUTransferBufferCreateInfo ri{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, kRing, 0};
         ring_ = SDL_CreateGPUTransferBuffer(dev, &ri);
+        const char* flat_prop = nullptr;
+        flat_ps_ = test_switch("SA2_D3D9GPU_FLAT_PS", "debug.sa2.flat_ps", &flat_prop);
+        if (flat_ps_)
+            std::fprintf(stderr, "d3d9gpu: every pixel shader is a flat grey one (%s), for measuring: the picture is wrong\n",
+                         flat_prop ? "debug.sa2.flat_ps=1" : "SA2_D3D9GPU_FLAT_PS=1");
+        // SA2_D3D9GPU_TINY_MIPS=1 (on Android debug.sa2.tiny_mips=1), the other measuring switch:
+        // with the shaders unchanged and their textures read from the smallest level, the frame
+        // time it saves is the texture fetches' share of what flat_ps saves.
+        const char* tiny_prop = nullptr;
+        tiny_mips_ = test_switch("SA2_D3D9GPU_TINY_MIPS", "debug.sa2.tiny_mips", &tiny_prop);
+        if (tiny_mips_)
+            std::fprintf(stderr, "d3d9gpu: every sampler reads its texture's smallest level (%s), for measuring: the "
+                         "picture is blurred\n", tiny_prop ? "debug.sa2.tiny_mips=1" : "SA2_D3D9GPU_TINY_MIPS=1");
+        const char* dump_prop = nullptr;
+        dump_spirv_ = test_switch("SA2_D3D9GPU_DUMP_SPIRV", "debug.sa2.dump_spirv", &dump_prop);
     }
 
     ~SdlGpu() override {
@@ -1008,12 +1045,29 @@ private:
         SDL_GPUShaderCreateInfo ci{};
         ci.code_size = b.spirv.size() * sizeof(uint32_t);
         ci.code = reinterpret_cast<const Uint8*>(b.spirv.data());
+        if (flat_ps_ && stage == shader::Stage::Pixel) {
+            ci.code_size = sizeof kFlatPixelShader;
+            ci.code = reinterpret_cast<const Uint8*>(kFlatPixelShader);
+        }
         ci.entrypoint = "main"; ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
         ci.stage = stage == shader::Stage::Vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
         ci.num_samplers = b.num_samplers; ci.num_uniform_buffers = b.num_uniform_buffers;
+        // SA2_D3D9GPU_DUMP_SPIRV=1 (on Android debug.sa2.dump_spirv=1), for reading the modules
+        // offline (spirv-dis): each one SDL is given, into SA2_PLAY_OUT, in creation order.
+        if (dump_spirv_) {
+            const char* dir = std::getenv("SA2_PLAY_OUT");
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/spirv-%03u-%s.spv", dir && *dir ? dir : ".", unsigned(shaders_.size()),
+                          stage == shader::Stage::Vertex ? "vs" : "ps");
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(ci.code, 1, ci.code_size, f);
+                std::fclose(f);
+            }
+        }
         auto object = std::make_unique<ShaderObject>(ShaderObject{nullptr});
         SDL_GPUShader* s = SDL_CreateGPUShader(dev_, &ci);
         if (!s) { err_ = std::string("SDL_CreateGPUShader: ") + SDL_GetError(); return nullptr; }
+        c_.shaders_made++;
         object->shader = s;
         ShaderObject* result = object.get();
         try { shaders_.emplace(std::move(key), std::move(object)); }
@@ -1043,8 +1097,11 @@ private:
         if (!props.error().empty()) { err_ = props.error(); return nullptr; }
         auto ci = desc.create_info(props.id());
         ci.vertex_shader = program.vertex->shader; ci.fragment_shader = program.pixel->shader;
+        const Uint64 t0 = SDL_GetTicksNS();
         SDL_GPUGraphicsPipeline* pipeline = SDL_CreateGPUGraphicsPipeline(dev_, &ci);
         if (!pipeline) { err_ = std::string("SDL_CreateGPUGraphicsPipeline: ") + SDL_GetError(); return nullptr; }
+        c_.pipelines_made++;
+        c_.pipeline_make_ns += SDL_GetTicksNS() - t0;
         try { bucket.push_back(PipelineEntry{std::vector<uint8_t>(key, key + n), pipeline}); }
         catch (...) { SDL_ReleaseGPUGraphicsPipeline(dev_, pipeline); throw; }
         return pipeline;
@@ -1094,6 +1151,9 @@ private:
             ci.enable_anisotropy = false;
             ci.max_anisotropy = 0.0f;
         }
+        // The measuring switch tiny_mips_: every sampler reads its texture's smallest level, so the
+        // texture fetches hit the cache and the shaders' arithmetic is left as it is.
+        if (tiny_mips_) { ci.min_lod = ci.max_lod = 1000.0f; ci.enable_anisotropy = false; }
         SDL_GPUSampler* sampler = SDL_CreateGPUSampler(dev_, &ci);
         if (!sampler) { err_ = std::string("SDL_CreateGPUSampler: ") + SDL_GetError(); return nullptr; }
         try { samplers_.emplace(key, sampler); }
@@ -1605,6 +1665,9 @@ private:
     uint32_t pending_count_ = 0;
     bool poisoned_ = false, swapchain_acquired_ = false;
     bool surface_gone_ = false;      // AfterAcquire::surface_gone: no swapchain acquire is made again
+    bool flat_ps_ = false;           // the measuring switch: kFlatPixelShader for every pixel shader
+    bool tiny_mips_ = false;         // the measuring switch: every sampler at its texture's smallest level
+    bool dump_spirv_ = false;        // each SPIR-V module SDL is given, into SA2_PLAY_OUT
     uint64_t presents_ = 0;          // present() calls (the surface-lost fault's frames)
     SDL_GPUCopyPass* copy_ = nullptr;
     // The open draw pass (open_pass, flush_pass): its attachments, and its draws' commands with

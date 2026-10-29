@@ -430,14 +430,15 @@ std::string Report::json() const {
     s += strf("  \"gpu\": {\"command_buffers\": %llu, \"submits\": %llu, \"waits\": %llu, \"ring_cycles\": %llu, "
               "\"dedicated_transfers\": %llu, \"render_passes\": %llu, \"copies\": %llu, \"uploads\": %llu, "
               "\"upload_bytes\": %llu, \"downloads\": %llu, \"blits\": %llu, \"clears_folded\": %llu, "
-              "\"clears_dropped\": %llu},\n",
+              "\"clears_dropped\": %llu, \"shaders_made\": %llu, \"pipelines_made\": %llu, \"pipeline_make_ms\": %.1f},\n",
               (unsigned long long)gpu_counters.command_buffers, (unsigned long long)gpu_counters.submits,
               (unsigned long long)gpu_counters.waits, (unsigned long long)gpu_counters.ring_cycles,
               (unsigned long long)gpu_counters.dedicated_transfers, (unsigned long long)gpu_counters.render_passes,
               (unsigned long long)gpu_counters.copies, (unsigned long long)gpu_counters.uploads,
               (unsigned long long)gpu_counters.upload_bytes, (unsigned long long)gpu_counters.downloads,
               (unsigned long long)gpu_counters.blits, (unsigned long long)gpu_counters.clears_folded,
-              (unsigned long long)gpu_counters.clears_dropped);
+              (unsigned long long)gpu_counters.clears_dropped, (unsigned long long)gpu_counters.shaders_made,
+              (unsigned long long)gpu_counters.pipelines_made, double(gpu_counters.pipeline_make_ns) / 1e6);
     // Answers: every method called, by interface and name, with its failures.
     s += "  \"methods\": [";
     bool first = true;
