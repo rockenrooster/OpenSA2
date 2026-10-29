@@ -457,9 +457,13 @@ ULONG STDMETHODCALLTYPE Device::Release() {
 void Device::close_frame() {
     Report& r = report();
     const uint64_t frame = r.presents + 1;
+    // A live session's runs stop at kLiveRuns (about five minutes of play, each frame's draw count
+    // differing): the report holds them all, and its write grows with them on the render thread.
+    // Replays and tests, which compare them, keep every run.
+    constexpr size_t kLiveRuns = 20000;
     if (!r.per_frame.empty() && r.per_frame.back()[2] == r.frame_draws && r.per_frame.back()[1] + 1 == frame)
         r.per_frame.back()[1] = frame;
-    else
+    else if (r.per_frame.size() < kLiveRuns || !gpu_ || !gpu_->info().live_session)
         r.per_frame.push_back({frame, frame, r.frame_draws});
     r.frame_draws = 0;
     // Preserve the census's DXVK CPU layout account; GPU uploads occurred at each draw.
@@ -509,8 +513,24 @@ HRESULT STDMETHODCALLTYPE Device::Present(const RECT* src, const RECT* dst, HWND
         gpu_->clear(bb_->image()->gpu, 0, v);
         r.scribbles++;
     }
-    if (r.presents % 100 == 0) write_report("replay", false);
+    if (r.presents % 100 == 0 && report_due(r)) write_report("replay", false);
     return answer(I_DEVICE, 17, ok ? D3D_OK : D3DERR_DRIVERINTERNALERROR);
+}
+
+// Whether the 100th Present rewrites the report. A replay or a test: always. A live session
+// (GpuInfo::live_session): its first 600 Presents, then every 3600th (a minute at 60 fps), and the
+// first after a new failure, so the crash report (host/android CrashReport.java) still finds the
+// device and any failure. Each write builds the report and the keys file on the render thread:
+// about 5 ms on a Snapdragon 750G's big core three minutes in, and more as per_frame grows.
+bool Device::report_due(const Report& r) {
+    if (!gpu_ || !gpu_->info().live_session || r.presents <= 600) return true;
+    const uint64_t failures = r.present_failures + r.backend_failed_draws + r.clear_host_failures +
+                              r.draw_failures.size() + (r.failure.empty() ? 0 : 1);
+    if (failures != reported_failures_) {
+        reported_failures_ = failures;
+        return true;
+    }
+    return r.presents % 3600 == 0;
 }
 
 // GetBackBuffer (:553-563, d3d9_swapchain.cpp:473-497).

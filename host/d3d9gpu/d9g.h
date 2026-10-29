@@ -540,8 +540,9 @@ public:
     void buffer_uploaded(uint64_t bytes) { report().buffer_upload_bytes += bytes; }
     bool can_swvp() const { return behavior_ & (D3DCREATE_MIXED_VERTEXPROCESSING | D3DCREATE_SOFTWARE_VERTEXPROCESSING); }
     bool only_swvp() const { return behavior_ & D3DCREATE_SOFTWARE_VERTEXPROCESSING; }
-    // Report rewrites: every 100 Presents and at the end.
+    // Report rewrites: every 100 Presents (in a live session less often: report_due) and at the end.
     void write_report(const char* phase, bool complete);
+    bool report_due(const Report& r);
     // The image's GPU texture made zero (d9g_resources.cpp, Texture and Surface makers); a DXT
     // image the GPU cannot sample is made BGRA8 and marked decoded, its levels the decoded zero blocks.
     uint32_t make_gpu_image(Image& img);
@@ -658,6 +659,7 @@ private:
     float clip_[6][4] = {};
     bool in_scene_ = false, swvp_ = false;
     uint64_t surface_lost_run_ = 0;  // consecutive Presents without the window's surface (PresentInfo::surface_lost)
+    uint64_t reported_failures_ = 0; // report_due's count of failures at the last live write
     VertexDecl* decl_ = nullptr;
     std::map<DWORD, VertexDecl*> fvf_decls_;   // SetFVF's declarations, the device's own
     VertexShader* vs_ = nullptr;
