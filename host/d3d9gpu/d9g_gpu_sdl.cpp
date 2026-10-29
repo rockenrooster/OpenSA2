@@ -3,6 +3,8 @@
 // Readback submits and waits, including every preceding draw before Present.
 // Transfer storage cycles, and so does each UP chunk at its first write in a command buffer
 // (upload_up); ordinary resources never cycle.
+// A whole clear waits (PendingClear) until a draw pass takes it as an attachment's load op or
+// anything else that touches its subresource encodes it first, so the call order still holds.
 #include "d9g.h"
 #include "d9g_props.h"
 #include "tweaks/tex-filter.h"
@@ -20,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -432,7 +435,8 @@ public:
                 if (std::holds_alternative<draw::OwnedIndexedUp>(v.geometry))
                     index = SDL_GPUBufferBinding{upload.buffer, upload.offset + up_index_offset};
             }
-            if (!open_pass(attachment_key, colours, p.has_ds ? &depth : nullptr)) return fail("draw render pass", err_);
+            if (!open_pass(attachment_key, colours, p.has_ds ? &depth : nullptr, render_w, render_h))
+                return fail("draw render pass", err_);
             // The draw joins the open pass's commands (flush_pass encodes them in one SDL render
             // pass), reduced against the state SDL will hold at that point of the pass (bound_):
             // a call that would set what is already set is left out, which leaves SDL's state as
@@ -541,6 +545,10 @@ public:
         if (it == tex_.end()) return;
         end_render();
         end_copy();
+        // its clears no one will see (and SDL may give a later texture the same handle)
+        pending_clears_.erase(std::remove_if(pending_clears_.begin(), pending_clears_.end(),
+                                             [&](const PendingClear& q) { return q.id == id; }),
+                              pending_clears_.end());
         SDL_ReleaseGPUTexture(dev_, it->second.t);   // SDL defers it past the GPU's use
         tex_.erase(it);
     }
@@ -576,6 +584,16 @@ public:
             bytes != level_upload_bytes(d, level)) {
             err_ = "upload of a level with the wrong size";
             return false;
+        }
+        // The open pass first (it may take the subresource's pending clear as a load op), then the
+        // upload overwrites the whole subresource: a colour clear still pending is never seen.
+        if (!end_render()) return false;
+        for (size_t i = 0; i < pending_clears_.size(); ++i) {
+            const PendingClear& q = pending_clears_[i];
+            if (q.id != id || q.layer != layer || q.level != level) continue;
+            if (!q.ds) { pending_clears_.erase(pending_clears_.begin() + std::ptrdiff_t(i)); c_.clears_dropped++; }
+            else if (!settle_clears(id, layer, level)) return false;
+            break;
         }
         SDL_GPUTransferBuffer* tb = nullptr;
         uint32_t off = 0;
@@ -623,37 +641,30 @@ public:
         if (level >= it->second.d.levels || (is_depth(it->second.d.fmt) && level > UINT8_MAX)) {
             err_ = "clear mip level is out of range"; return false;
         }
-        if (!end_render() || !end_copy()) return false;
-        SDL_GPUCommandBuffer* cb = cmd();
-        if (!cb) return false;
-        SDL_GPURenderPass* rp = nullptr;
-        if (is_depth(it->second.d.fmt)) {
-            SDL_GPUDepthStencilTargetInfo ds{};
-            ds.texture = it->second.t;
-            ds.clear_depth = v.z;
-            ds.load_op = v.depth ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
-            ds.store_op = SDL_GPU_STOREOP_STORE;
-            ds.stencil_load_op = v.stencil ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
-            ds.stencil_store_op = SDL_GPU_STOREOP_STORE;
-            ds.cycle = false;
-            ds.clear_stencil = Uint8(v.s);
-            ds.mip_level = Uint8(level);
-            ds.layer = Uint8(layer);
-            if (!encode_call("SDL_BeginGPURenderPass(clear)", [&] { rp = SDL_BeginGPURenderPass(cb, nullptr, 0, &ds); })) return false;
-        } else {
-            SDL_GPUColorTargetInfo ct{};
-            ct.texture = it->second.t;
-            ct.mip_level = level;
-            ct.layer_or_depth_plane = layer;
-            ct.clear_color = SDL_FColor{v.rgba[0], v.rgba[1], v.rgba[2], v.rgba[3]};
-            ct.load_op = v.colour ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
-            ct.store_op = SDL_GPU_STOREOP_STORE;
-            ct.cycle = false;
-            if (!encode_call("SDL_BeginGPURenderPass(clear)", [&] { rp = SDL_BeginGPURenderPass(cb, &ct, 1, nullptr); })) return false;
+        // Not encoded here (PendingClear). The open pass's draws come before the clear, so it is
+        // flushed first; an attachment of it whose aspects the clear covers is not stored, as
+        // nothing can read that content before the clear (every reader encodes the clear first).
+        const bool ds = is_depth(it->second.d.fmt);
+        if (pass_open_) drop_cleared_stores(it->second.t, layer, level, ds, v);
+        if (!end_render()) return false;
+        PendingClear* q = nullptr;
+        for (PendingClear& p : pending_clears_)
+            if (p.id == id && p.layer == layer && p.level == level) { q = &p; break; }
+        if (!q) {
+            if (ds ? !(v.depth || v.stencil) : !v.colour) return true;   // loads every aspect: no change
+            pending_clears_.push_back(PendingClear{});
+            q = &pending_clears_.back();
+            q->id = id; q->layer = layer; q->level = level; q->texture = it->second.t; q->ds = ds;
+        } else if (ds ? (v.depth && q->depth) || (v.stencil && q->stencil) : v.colour && q->colour) {
+            c_.clears_dropped++;   // a clear no draw saw, overwritten by this one
         }
-        if (!rp) { err_ = std::string("SDL_BeginGPURenderPass: ") + SDL_GetError(); return false; }
-        if (!encode_call("SDL_EndGPURenderPass(clear)", [&] { SDL_EndGPURenderPass(rp); })) return false;
-        c_.render_passes++;
+        if (ds) {
+            if (v.depth) { q->depth = true; q->z = v.z; }
+            if (v.stencil) { q->stencil = true; q->s = Uint8(v.s); }
+        } else if (v.colour) {
+            q->colour = true;
+            q->rgba = SDL_FColor{v.rgba[0], v.rgba[1], v.rgba[2], v.rgba[3]};
+        }
         return true;
     }
 
@@ -671,6 +682,7 @@ public:
             uint64_t(dx) + w > level_dim(b->second.d.w, dl) || uint64_t(dy) + h > level_dim(b->second.d.h, dl)) {
             err_ = "texture copy interval or format is invalid"; return false;
         }
+        if (!settle_clears(src, sa, sl) || !settle_clears(dst, da, dl)) return false;
         SDL_GPUTextureLocation from{a->second.t, sl, sa, sx, sy, 0};
         SDL_GPUTextureLocation to{b->second.t, dl, da, dx, dy, 0};
         SDL_GPUCopyPass* cp = copy_pass();
@@ -695,6 +707,7 @@ public:
             down_size_ = down_ ? uint32_t(bytes) : 0;
             if (!down_) { err_ = std::string("SDL_CreateGPUTransferBuffer: ") + SDL_GetError(); return false; }
         }
+        if (!settle_clears(id, 0, level)) return false;
         SDL_GPUCopyPass* cp = copy_pass();
         if (!cp) return false;
         SDL_GPUTextureRegion from{it->second.t, level, 0, 0, 0, 0, lw, lh, 1};
@@ -718,7 +731,7 @@ public:
         *out = PresentInfo{};
         auto it = tex_.find(bb);
         if (it == tex_.end()) { err_ = "present of an unknown texture"; return false; }
-        if (!end_render() || !end_copy()) return false;
+        if (!end_render() || !settle_clears(bb, 0, 0) || !end_copy()) return false;
         presents_++;
         if (win_) {
             SDL_GPUCommandBuffer* cb = cmd();
@@ -1156,7 +1169,7 @@ private:
     // it is that pass, else a new one after the open one is flushed. Nothing reaches SDL until
     // flush_pass, so a DrawPrimitiveUP draw's upload no longer ends the pass it draws in.
     bool open_pass(const std::string& key, const std::vector<SDL_GPUColorTargetInfo>& colours,
-                   const SDL_GPUDepthStencilTargetInfo* depth) {
+                   const SDL_GPUDepthStencilTargetInfo* depth, uint32_t w, uint32_t h) {
         if (poisoned_) return false;
         if (pass_open_ && pass_key_.size() == key.size() && same_bytes(pass_key_.data(), key.data(), key.size())) return true;
         if (!flush_pass()) return false;
@@ -1164,19 +1177,23 @@ private:
         pass_colours_ = colours;
         pass_has_depth_ = depth != nullptr;
         if (depth) pass_depth_ = *depth;
+        pass_w_ = w; pass_h_ = h;
         pass_open_ = true;
         bound_.reset();
         return true;
     }
     // Ends the draw pass (end_render's work): the pending UP uploads in a copy pass, then the open
-    // pass's commands in one SDL render pass, LOAD and STORE on every attachment as before. After
-    // it no render pass is open, so a copy, clear, Present or submission may follow.
+    // pass's commands in one SDL render pass, LOAD and STORE on every attachment unless a pending
+    // clear becomes the load op (take_pending_clears) or a clear right after drops the store
+    // (clear_layer). After it no render pass is open, so a copy, clear, Present or submission may
+    // follow.
     bool flush_pass() {
         if (poisoned_) return false;
         if (!encode_up_copies()) return false;
         if (!pass_open_) return true;
         if (cmds_.empty()) { close_pass(); return true; }
         if (!end_copy()) return false;
+        if (!take_pending_clears()) return false;
         SDL_GPUCommandBuffer* cb = cmd();
         if (!cb) return false;
         SDL_ClearError();
@@ -1198,6 +1215,116 @@ private:
         pass_open_ = false;
         pass_key_.clear();
         cmds_.clear(); rec_bindings_.clear(); rec_samplers_.clear(); rec_uniforms_.clear();
+    }
+    // flush_pass's share of the pending clears, before its SDL render pass begins: one of an
+    // attachment becomes that attachment's load op (on a tiled GPU neither the clear's write-out
+    // nor the pass's read-back happens), and one of a texture the pass's draws sample is encoded
+    // first as its own pass. The pass's draws were all recorded after those clears (clear_layer
+    // flushes the open pass), so every one of them sees the cleared contents. A load op acts on
+    // the render area only, which SDL makes the smallest attachment's size: an attachment larger
+    // than that (a depth buffer under a smaller target) has its clear encoded first instead.
+    bool take_pending_clears() {
+        for (size_t i = 0; i < pending_clears_.size();) {
+            const PendingClear& q = pending_clears_[i];
+            SDL_GPUColorTargetInfo* colour = nullptr;
+            bool attached = false;
+            if (q.ds) {
+                attached = pass_has_depth_ && pass_depth_.texture == q.texture && pass_depth_.layer == q.layer &&
+                           pass_depth_.mip_level == q.level;
+            } else {
+                for (SDL_GPUColorTargetInfo& c : pass_colours_)
+                    if (c.texture == q.texture && c.layer_or_depth_plane == q.layer && c.mip_level == q.level) {
+                        colour = &c;
+                        attached = true;
+                    }
+            }
+            const auto t = tex_.find(q.id);
+            const bool whole = t != tex_.end() && level_dim(t->second.d.w, q.level) == pass_w_ &&
+                               level_dim(t->second.d.h, q.level) == pass_h_;
+            if (attached && whole) {
+                if (q.ds) {
+                    if (q.depth) { pass_depth_.load_op = SDL_GPU_LOADOP_CLEAR; pass_depth_.clear_depth = q.z; }
+                    if (q.stencil) { pass_depth_.stencil_load_op = SDL_GPU_LOADOP_CLEAR; pass_depth_.clear_stencil = q.s; }
+                } else {
+                    colour->load_op = SDL_GPU_LOADOP_CLEAR;
+                    colour->clear_color = q.rgba;
+                }
+                pending_clears_.erase(pending_clears_.begin() + std::ptrdiff_t(i));
+                c_.clears_folded++;
+                continue;
+            }
+            if (attached || std::any_of(rec_samplers_.begin(), rec_samplers_.end(),
+                                        [&](const SDL_GPUTextureSamplerBinding& b) { return b.texture == q.texture; })) {
+                if (!encode_pending_clear(i)) return false;
+                continue;
+            }
+            ++i;
+        }
+        return true;
+    }
+    // clear_layer's part of the open pass: the stores of the aspects a whole clear of (t, layer,
+    // level) is about to overwrite, which nothing reads in between.
+    void drop_cleared_stores(SDL_GPUTexture* t, uint32_t layer, uint32_t level, bool ds, const ClearValue& v) {
+        if (ds) {
+            if (pass_has_depth_ && pass_depth_.texture == t && pass_depth_.layer == layer && pass_depth_.mip_level == level) {
+                if (v.depth) pass_depth_.store_op = SDL_GPU_STOREOP_DONT_CARE;
+                if (v.stencil) pass_depth_.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+            }
+        } else if (v.colour) {
+            for (SDL_GPUColorTargetInfo& c : pass_colours_)
+                if (c.texture == t && c.layer_or_depth_plane == layer && c.mip_level == level)
+                    c.store_op = SDL_GPU_STOREOP_DONT_CARE;
+        }
+    }
+    // The pending clears of texture `id`'s subresource (layer, level) encoded, before an operation
+    // outside a draw pass reads or writes it; the open pass may take one as a load op first.
+    bool settle_clears(uint32_t id, uint32_t layer, uint32_t level) {
+        auto hit = [&](const PendingClear& q) { return q.id == id && q.layer == layer && q.level == level; };
+        if (std::none_of(pending_clears_.begin(), pending_clears_.end(), hit)) return true;
+        if (!end_render()) return false;
+        for (size_t i = 0; i < pending_clears_.size();) {
+            if (!hit(pending_clears_[i])) { ++i; continue; }
+            if (!encode_pending_clear(i)) return false;
+        }
+        return true;
+    }
+    // Pending clear `i` as its own render pass (the encoding clear_layer made at once before),
+    // removed from the list. No SDL render pass may be open.
+    bool encode_pending_clear(size_t i) {
+        const PendingClear q = pending_clears_[i];
+        pending_clears_.erase(pending_clears_.begin() + std::ptrdiff_t(i));
+        if (!end_copy()) return false;
+        SDL_GPUCommandBuffer* cb = cmd();
+        if (!cb) return false;
+        SDL_GPURenderPass* rp = nullptr;
+        if (q.ds) {
+            SDL_GPUDepthStencilTargetInfo ds{};
+            ds.texture = q.texture;
+            ds.clear_depth = q.z;
+            ds.load_op = q.depth ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            ds.store_op = SDL_GPU_STOREOP_STORE;
+            ds.stencil_load_op = q.stencil ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            ds.stencil_store_op = SDL_GPU_STOREOP_STORE;
+            ds.cycle = false;
+            ds.clear_stencil = q.s;
+            ds.mip_level = Uint8(q.level);
+            ds.layer = Uint8(q.layer);
+            if (!encode_call("SDL_BeginGPURenderPass(clear)", [&] { rp = SDL_BeginGPURenderPass(cb, nullptr, 0, &ds); })) return false;
+        } else {
+            SDL_GPUColorTargetInfo ct{};
+            ct.texture = q.texture;
+            ct.mip_level = q.level;
+            ct.layer_or_depth_plane = q.layer;
+            ct.clear_color = q.rgba;
+            ct.load_op = SDL_GPU_LOADOP_CLEAR;
+            ct.store_op = SDL_GPU_STOREOP_STORE;
+            ct.cycle = false;
+            if (!encode_call("SDL_BeginGPURenderPass(clear)", [&] { rp = SDL_BeginGPURenderPass(cb, &ct, 1, nullptr); })) return false;
+        }
+        if (!rp) { err_ = std::string("SDL_BeginGPURenderPass: ") + SDL_GetError(); return false; }
+        if (!encode_call("SDL_EndGPURenderPass(clear)", [&] { SDL_EndGPURenderPass(rp); })) return false;
+        c_.render_passes++;
+        return true;
     }
     Cmd& record(Op op) {
         cmds_.emplace_back();
@@ -1483,6 +1610,7 @@ private:
     // The open draw pass (open_pass, flush_pass): its attachments, and its draws' commands with
     // their variable parts in the three arenas (a command's span of one, [at, at + n)).
     bool pass_open_ = false, pass_has_depth_ = false;
+    uint32_t pass_w_ = 0, pass_h_ = 0;   // its render area: the smallest attachment level's size
     std::string pass_key_;
     std::vector<SDL_GPUColorTargetInfo> pass_colours_;
     SDL_GPUDepthStencilTargetInfo pass_depth_{};
@@ -1490,6 +1618,18 @@ private:
     std::vector<SDL_GPUBufferBinding> rec_bindings_;
     std::vector<SDL_GPUTextureSamplerBinding> rec_samplers_;
     std::vector<uint8_t> rec_uniforms_;
+    // The whole clears clear_layer has not encoded, one per subresource (a later clear of it
+    // merges in); a frame holds a handful, so a list.
+    struct PendingClear {
+        uint32_t id = 0, layer = 0, level = 0;
+        SDL_GPUTexture* texture = nullptr;
+        bool ds = false;                                // a depth-stencil texture
+        bool colour = false, depth = false, stencil = false;
+        SDL_FColor rgba{};
+        float z = 0.0f;
+        Uint8 s = 0;
+    };
+    std::vector<PendingClear> pending_clears_;
     // What the open pass's commands so far leave SDL holding (open_pass resets it): spans of the
     // arenas for the vertex buffers, samplers and uniform slots.
     struct Bound {

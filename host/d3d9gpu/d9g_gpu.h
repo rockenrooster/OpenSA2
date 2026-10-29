@@ -240,6 +240,8 @@ inline AfterAcquire after_acquire(bool acquired, bool texture, const char* sdl_e
 struct GpuCounters {
     uint64_t command_buffers = 0, submits = 0, waits = 0, ring_cycles = 0, dedicated_transfers = 0;
     uint64_t render_passes = 0, copies = 0, uploads = 0, upload_bytes = 0, downloads = 0, blits = 0;
+    // whole clears a draw pass took as a load op, and ones overwritten before anything saw them
+    uint64_t clears_folded = 0, clears_dropped = 0;
 };
 
 // One texture's bytes as made (every level, face and slice; BC as blocks, D32S8 as 8 bytes a texel):
