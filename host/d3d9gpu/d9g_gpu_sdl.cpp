@@ -981,7 +981,7 @@ private:
                               vertex_uniform, fragment_uniform, viewport, scissor, blend, stencil, draw, draw_indexed };
     struct Cmd {
         Op op = Op::draw;
-        uint8_t small = 0;         // a uniform slot, an index element size or the stencil reference
+        uint8_t small = 0;         // a uniform slot, an index element size, the stencil reference or a first vertex slot
         uint32_t at = 0, n = 0;
         union U {
             SDL_GPUGraphicsPipeline* pipeline;
@@ -1392,20 +1392,25 @@ private:
         c.op = op;
         return c;
     }
+    // Slots 0..n-1 as `b`, binding only the run of slots that differs from what the open pass
+    // holds: a draw usually changes stream 0 alone, and SDL tracks each buffer of a bind, so
+    // rebinding the semantic-null filler up to slot 15 at every draw cost the render thread more
+    // than the draw's own buffers.
     void record_vertex_buffers(const SDL_GPUBufferBinding* b, uint32_t n) {
-        if (bound_.n_vbs == n) {
-            bool same = true;
-            for (uint32_t i = 0; i < n && same; ++i)
-                same = rec_bindings_[bound_.vbs + i].buffer == b[i].buffer && rec_bindings_[bound_.vbs + i].offset == b[i].offset;
-            if (same) return;
-        }
+        auto same = [&](uint32_t i) { return bound_.vb[i].buffer == b[i].buffer && bound_.vb[i].offset == b[i].offset; };
+        const uint32_t known = std::min(n, bound_.n_vbs);
+        uint32_t first = 0, last = n;
+        while (first < known && same(first)) ++first;
+        if (first == n) return;
+        while (last > first && last - 1 < known && same(last - 1)) --last;
         // The arena first, the command after: an allocation that throws (draw() turns bad_alloc
         // into a Failure) then leaves no command whose span has nothing behind it.
         const uint32_t at = uint32_t(rec_bindings_.size());
-        rec_bindings_.insert(rec_bindings_.end(), b, b + n);
+        rec_bindings_.insert(rec_bindings_.end(), b + first, b + last);
         Cmd& c = record(Op::vertex_buffers);
-        c.at = at; c.n = n;
-        bound_.vbs = at; bound_.n_vbs = n;
+        c.small = uint8_t(first); c.at = at; c.n = last - first;
+        std::copy(b + first, b + last, bound_.vb.begin() + first);
+        bound_.n_vbs = std::max(bound_.n_vbs, last);
     }
     void record_index_buffer(const SDL_GPUBufferBinding& b, SDL_GPUIndexElementSize size) {
         if (bound_.has_index && bound_.index.buffer == b.buffer && bound_.index.offset == b.offset && bound_.index_size == size)
@@ -1450,7 +1455,7 @@ private:
         for (const Cmd& c : cmds_) {
             switch (c.op) {
             case Op::pipeline: SDL_BindGPUGraphicsPipeline(pass, c.u.pipeline); break;
-            case Op::vertex_buffers: SDL_BindGPUVertexBuffers(pass, 0, rec_bindings_.data() + c.at, c.n); break;
+            case Op::vertex_buffers: SDL_BindGPUVertexBuffers(pass, c.small, rec_bindings_.data() + c.at, c.n); break;
             case Op::index_buffer: SDL_BindGPUIndexBuffer(pass, &c.u.buffer, SDL_GPUIndexElementSize(c.small)); break;
             case Op::vertex_samplers: SDL_BindGPUVertexSamplers(pass, 0, rec_samplers_.data() + c.at, c.n); break;
             case Op::fragment_samplers: SDL_BindGPUFragmentSamplers(pass, 0, rec_samplers_.data() + c.at, c.n); break;
@@ -1697,7 +1702,8 @@ private:
     // arenas for the vertex buffers, samplers and uniform slots.
     struct Bound {
         SDL_GPUGraphicsPipeline* pipeline = nullptr;
-        uint32_t vbs = 0, n_vbs = 0;
+        std::array<SDL_GPUBufferBinding, 16> vb{};   // slots 0..n_vbs-1 as bound
+        uint32_t n_vbs = 0;
         SDL_GPUBufferBinding index{};
         SDL_GPUIndexElementSize index_size = SDL_GPU_INDEXELEMENTSIZE_16BIT;
         bool has_index = false;
