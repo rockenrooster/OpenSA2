@@ -405,7 +405,9 @@ std::string Report::json() const {
         reasons += "]";
         std::string record = "[";
         if (gpu.shader_facts_ok) {
-            const std::string rec = shader::determine_profile(gpu.shader_facts).record();
+            shader::D3D9Config d3d9;
+            d3d9.float_emulation_strict = !gpu.fast_float_emulation;
+            const std::string rec = shader::determine_profile(gpu.shader_facts, d3d9).record();
             size_t at = 0, n = 0;
             for (size_t nl; (nl = rec.find('\n', at)) != std::string::npos; at = nl + 1)
                 record += (n++ ? ", " : "") + jstr(rec.substr(at, nl - at));

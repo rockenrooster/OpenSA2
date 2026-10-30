@@ -1993,6 +1993,17 @@ std::unique_ptr<Gpu> make_sdl_gpu(bool debug, const CapsOff& off, std::string* e
     if (vk11_forced)
         std::fprintf(stderr, "d3d9gpu: %s: the Vulkan device is made at API 1.1 and the shaders are lowered to SPIR-V 1.3\n",
                      vk11_switch.c_str());
+    // d3d9.floatEmulation. host/player/dxvk.conf pins Strict, which gives every multiply a zero test
+    // and two selects per component; DXVK's own Auto keeps Strict only on drivers with a native
+    // legacy multiply (RADV, Intel's Mesa driver) and takes Enabled elsewhere, Adreno and Mali among
+    // them, where Strict cost the Moto One 5G Ace about 9% of its frame rate at 2400x1080 (52.3 to
+    // 57.0 fps idle in City Escape, 2026-10-29). A live session takes Enabled (GpuInfo::
+    // fast_float_emulation, below); SA2_D3D9GPU_STRICT_FLOAT=1 (on Android debug.sa2.strict_float=1)
+    // keeps Strict in one, and SA2_D3D9GPU_FAST_FLOAT=1 (debug.sa2.fast_float=1) asks Enabled in any run.
+    const char* fast_float_prop = nullptr;
+    const bool fast_float = test_switch("SA2_D3D9GPU_FAST_FLOAT", "debug.sa2.fast_float", &fast_float_prop);
+    const char* strict_float_prop = nullptr;
+    const bool strict_float = test_switch("SA2_D3D9GPU_STRICT_FLOAT", "debug.sa2.strict_float", &strict_float_prop);
     using shader::DeviceAnswer;
     using shader::DeviceRequest;
     using shader::DeviceStep;
@@ -2176,6 +2187,12 @@ std::unique_ptr<Gpu> make_sdl_gpu(bool debug, const CapsOff& off, std::string* e
     info.vk13_below_device = !below13.empty();
     info.live_session = SDL_GetBooleanProperty(SDL_GetGlobalProperties(), kLiveSessionProperty, false);
     info.depth_clamp_clip_only = !info.depth_clip_and_clamp && (info.live_session || clamp_forced_off);
+    info.fast_float_emulation = fast_float || (info.live_session && !strict_float);
+    if (fast_float || strict_float)
+        std::fprintf(stderr, "d3d9gpu: %s: the shaders are translated with d3d9.floatEmulation = %s\n",
+                     fast_float ? (fast_float_prop ? "debug.sa2.fast_float=1" : "SA2_D3D9GPU_FAST_FLOAT=1")
+                                : (strict_float_prop ? "debug.sa2.strict_float=1" : "SA2_D3D9GPU_STRICT_FLOAT=1"),
+                     info.fast_float_emulation ? "Enabled" : "Strict");
     // Without depth clip and clamp every pipeline owes the clamp (R_DEPTH_CLAMP), so say once which
     // way the draws go: clip-only, or refused by name.
     if (!info.depth_clip_and_clamp) {

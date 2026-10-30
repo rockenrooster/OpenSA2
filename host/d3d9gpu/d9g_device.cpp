@@ -105,7 +105,9 @@ Device::Device(std::unique_ptr<Gpu> gpu, const DeviceSetup& s) : gpu_(std::move(
     // them every shader is refused at creation, by name (translate_shader)
     shader_profile_ok_ = gpu_->info().shader_facts_ok;
     if (shader_profile_ok_) {
-        shader_profile_ = shader::determine_profile(gpu_->info().shader_facts);
+        shader::D3D9Config d3d9;
+        d3d9.float_emulation_strict = !gpu_->info().fast_float_emulation;
+        shader_profile_ = shader::determine_profile(gpu_->info().shader_facts, d3d9);
         const std::string rec = shader_profile_.record();
         Sha256 h;
         h.update(rec.data(), rec.size());

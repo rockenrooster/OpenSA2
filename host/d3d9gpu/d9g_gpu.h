@@ -128,6 +128,10 @@ struct GpuInfo {
     bool depth_clamp_forced_off = false;
     bool live_session = false;
     bool depth_clamp_clip_only = false;
+    // The shaders' d3d9.floatEmulation (shader::D3D9Config): Enabled, DXVK's choice on a driver
+    // without a legacy multiply, in a live session or where SA2_D3D9GPU_FAST_FLOAT=1 asks it, else
+    // Strict as host/player/dxvk.conf pins it (d9g_gpu_sdl.cpp make_sdl_gpu).
+    bool fast_float_emulation = false;
     // The Vulkan 1.1 profile (shader::ApiLevel::vk11): SDL_gpu's device made at API 1.1, so
     // shader_facts.vk11 and every module lowered to SPIR-V 1.3 (ShaderProfile::vk11). vk11_reason says
     // why: forced by its switch, no device taking the 1.3 profile, or a GPU that needs it preferred over a
