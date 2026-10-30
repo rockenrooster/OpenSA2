@@ -10,6 +10,7 @@ prepared for submission: the user's rulings of 2026-10-04
 |---|---|
 | `0001-gpu-clamp-to-border-and-depth-clamp-with-clip.patch` | Border addressing (`SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_BORDER` and a border colour) and depth clamp beside depth clip, on Vulkan, D3D12 and Metal, with two device properties that report support |
 | `0002-gpu-vulkan-pipeline-cache.patch` | A Vulkan pipeline cache kept in a file (`SDL_PROP_GPU_DEVICE_CREATE_SA2RECOMP_PIPELINE_CACHE_PATH_STRING`): seeded from it at device creation, passed to every pipeline, written back after every 16 new graphics pipelines and at device destruction. Without the property, pipelines are made without a cache, as before. |
+| `0003-gpu-vulkan-bind-changed-descriptor-sets.patch` | Before a draw, the Vulkan backend binds only the run of descriptor sets that changed, with their dynamic offsets, binds none when only vertex buffers changed, and skips an empty vkUpdateDescriptorSets. |
 
 Each patch's header names what it changes, the SDL commit it targets
 (`fa2c02bb6e21974a89ea9824bc53c9932abe5f9c`, the commit the release tarball records in its

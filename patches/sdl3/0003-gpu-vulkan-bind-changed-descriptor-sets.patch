@@ -1,0 +1,122 @@
+sa2-recomp local patch 0003 to SDL 3.4.16: bind only the descriptor sets that changed
+
+    NOT FROM THE SDL PROJECT. This patch belongs to the SA2 Recompiled
+    project and was written for it by an AI agent (Claude). It is not
+    submitted to SDL and is not meant for submission, like patch 0001.
+
+    Target: SDL release 3.4.16 (tag release-3.4.16), commit
+    fa2c02bb6e21974a89ea9824bc53c9932abe5f9c, the commit the release
+    tarball records in its own .git-hash file. The tarball is
+    SDL3-3.4.16.tar.gz, sha256
+    7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68.
+    It applies on top of patches 0001 and 0002.
+
+    What it changes: before each draw the Vulkan backend's
+    VULKAN_INTERNAL_BindGraphicsDescriptorSets bound all four descriptor
+    sets, with every dynamic uniform offset, whenever anything at all had
+    changed since the last draw, a new vertex buffer included, and called
+    vkUpdateDescriptorSets even with nothing to write. On a Moto One 5G Ace
+    (Adreno 619) the driver's share of that call was 1.4 ms of the player's
+    render thread a frame in City Escape, about 1100 draws a frame.
+
+    - It binds only the run of sets from the first that changed to the
+      last (set 1 and set 3 also when only their uniform buffers' dynamic
+      offsets moved), with the dynamic offsets of the uniform sets inside
+      the run. The bound pipeline's layout keeps the sets bound before it
+      valid, and binding a pipeline marks every set, so a new layout is
+      still bound whole.
+    - A draw that changed only its vertex buffers binds no set.
+    - vkUpdateDescriptorSets is not called with no write.
+
+    No struct layout of SDL's API changes and no function is added.
+    Marked as modified as patch 0001 says: the vendor id covers all the
+    patches, in file-name order.
+
+    How to apply it: after 0001 and 0002, strictly, in the top directory
+    of the extracted tarball, with GNU patch in the C locale,
+
+      LC_ALL=C patch -p1 --fuzz=0 --forward --batch < 0003-gpu-vulkan-bind-changed-descriptor-sets.patch
+
+    refusing any hunk placed at an offset (tools/s5/sdl3_patches.py).
+
+   src/gpu/vulkan/SDL_gpu_vulkan.c | 53 +++++++++++++++++++++++----------
+   1 file changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/src/gpu/vulkan/SDL_gpu_vulkan.c b/src/gpu/vulkan/SDL_gpu_vulkan.c
+index 71aec4d..6a0b6bc 100644
+--- a/src/gpu/vulkan/SDL_gpu_vulkan.c
++++ b/src/gpu/vulkan/SDL_gpu_vulkan.c
+@@ -5257,6 +5257,13 @@ static void VULKAN_INTERNAL_BindGraphicsDescriptorSets(
+         return;
+     }
+ 
++    // sa2-recomp patch 0003: the descriptor sets this call has to bind (set 1 and set 3 also when
++    // only their uniform buffers' dynamic offsets moved)
++    const bool bindSet0 = commandBuffer->needNewVertexResourceDescriptorSet;
++    const bool bindSet1 = commandBuffer->needNewVertexUniformDescriptorSet || commandBuffer->needNewVertexUniformOffsets;
++    const bool bindSet2 = commandBuffer->needNewFragmentResourceDescriptorSet;
++    const bool bindSet3 = commandBuffer->needNewFragmentUniformDescriptorSet || commandBuffer->needNewFragmentUniformOffsets;
++
+     if (commandBuffer->needVertexBufferBind && commandBuffer->vertexBufferCount > 0) {
+         renderer->vkCmdBindVertexBuffers(
+             commandBuffer->commandBuffer,
+@@ -5508,12 +5515,14 @@ static void VULKAN_INTERNAL_BindGraphicsDescriptorSets(
+         dynamicOffsetCount += 1;
+     }
+ 
+-    renderer->vkUpdateDescriptorSets(
+-        renderer->logicalDevice,
+-        writeCount,
+-        writeDescriptorSets,
+-        0,
+-        NULL);
++    if (writeCount > 0) { // sa2-recomp patch 0003: no empty update
++        renderer->vkUpdateDescriptorSets(
++            renderer->logicalDevice,
++            writeCount,
++            writeDescriptorSets,
++            0,
++            NULL);
++    }
+ 
+     VkDescriptorSet sets[4];
+     sets[0] = commandBuffer->vertexResourceDescriptorSet;
+@@ -5521,15 +5530,29 @@ static void VULKAN_INTERNAL_BindGraphicsDescriptorSets(
+     sets[2] = commandBuffer->fragmentResourceDescriptorSet;
+     sets[3] = commandBuffer->fragmentUniformDescriptorSet;
+ 
+-    renderer->vkCmdBindDescriptorSets(
+-        commandBuffer->commandBuffer,
+-        VK_PIPELINE_BIND_POINT_GRAPHICS,
+-        resourceLayout->pipelineLayout,
+-        0,
+-        4,
+-        sets,
+-        dynamicOffsetCount,
+-        dynamicOffsets);
++    // sa2-recomp patch 0003: only the run of sets from the first that changed to the last, which
++    // the bound pipeline's layout keeps compatible with the sets bound before it (a pipeline bind
++    // marks every set, so a new layout is bound whole), with the dynamic offsets of the uniform
++    // sets inside the run: dynamicOffsets holds set 1's, then set 3's. A draw that changed only
++    // its vertex buffers binds no set at all.
++    if (bindSet0 || bindSet1 || bindSet2 || bindSet3) {
++        const Uint32 firstSet = bindSet0 ? 0 : bindSet1 ? 1 : bindSet2 ? 2 : 3;
++        const Uint32 lastSet = bindSet3 ? 3 : bindSet2 ? 2 : bindSet1 ? 1 : 0;
++        const Uint32 offsetFirst = firstSet <= 1 ? 0 : resourceLayout->vertexUniformBufferCount;
++        const Uint32 offsetCount =
++            (firstSet <= 1 && lastSet >= 1 ? resourceLayout->vertexUniformBufferCount : 0) +
++            (lastSet >= 3 ? resourceLayout->fragmentUniformBufferCount : 0);
++
++        renderer->vkCmdBindDescriptorSets(
++            commandBuffer->commandBuffer,
++            VK_PIPELINE_BIND_POINT_GRAPHICS,
++            resourceLayout->pipelineLayout,
++            firstSet,
++            lastSet - firstSet + 1,
++            &sets[firstSet],
++            offsetCount,
++            offsetCount ? &dynamicOffsets[offsetFirst] : NULL);
++    }
+ 
+     commandBuffer->needNewVertexUniformOffsets = false;
+     commandBuffer->needNewFragmentUniformOffsets = false;
