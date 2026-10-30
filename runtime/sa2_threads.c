@@ -15,6 +15,7 @@ long syscall(long number, ...);
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "cpu_state.h"
 #include "guest_memory.h"
@@ -125,6 +126,26 @@ uint64_t sa2_sched_frames(void)   { return g_frames; }
 static int      g_budget_hit;
 uint64_t sa2_sched_budget_us(void) { return g_budget_us; }
 int      sa2_sched_budget_hit(void) { return g_budget_hit; }
+
+/* SA2_CLOCK_FOLLOWS_REAL=1, live play's (host/launch, host/android): a frame boundary moves the
+ * virtual clock to no less than the real time elapsed since the run's first frame boundary
+ * (follow_real). The guest's sound devices answer every cursor and timer from the virtual clock
+ * and the player's mixer renders the stream's sound by it (host/player/mixer.h), so a game drawing
+ * below 60 frames a second handed the player less than a second of sound a second: at 2400x1080
+ * on a Moto One 5G Ace (about 52 fps) 30% of the audio device's requests found its queue short
+ * (2026-10-29), heard as stutter. Kept up with real time, the sound plays at its own rate and a
+ * slow frame slows only the frame-locked game, as on a PC. One boundary catches up at most
+ * kFollowCatchup periods past its own next one; a longer gap (the app in the background, a long
+ * load) is let go rather than caught up all at once. A game at or above 60 fps never moves it.
+ * Unset or any other value, the clock is the frame clock alone: replays, the selftest, every
+ * receipt's run. */
+#define kFollowCatchup 4u
+static int      g_follow_real;
+static uint64_t g_follow_base_ns, g_follow_base_us;
+static uint64_t g_follow_moves, g_follow_moved_us, g_follow_dropped_us;
+uint64_t sa2_sched_follow_moves(void)      { return g_follow_moves; }
+uint64_t sa2_sched_follow_moved_us(void)   { return g_follow_moved_us; }
+uint64_t sa2_sched_follow_dropped_us(void) { return g_follow_dropped_us; }
 
 static uint32_t g_spin_advance;        /* SA2_SPIN_ADVANCE; 0 = off */
 /* SA2_CS_HANDOFF: 1 = LeaveCriticalSection hands off, which is G1's own list
@@ -290,6 +311,11 @@ void sa2_threads_config_from_env(void) {
     if (v && *v) g_budget_us = strtoull(v, NULL, 0) * 1000ull;
     v = getenv("SA2_FRAME_US");
     if (v && *v) g_frame_us = strtoull(v, NULL, 0);
+    v = getenv("SA2_CLOCK_FOLLOWS_REAL");
+    g_follow_real = v && !strcmp(v, "1");
+    if (g_follow_real)
+        fprintf(stderr, "sa2 clock: SA2_CLOCK_FOLLOWS_REAL=1: a frame boundary keeps the virtual clock up "
+                        "with real time, at most %u frames at once\n", kFollowCatchup);
     v = getenv("SA2_SPIN_ADVANCE");
     if (v && *v) g_spin_advance = (uint32_t)strtoul(v, NULL, 0);
     v = getenv("SA2_SPIN_YIELDS");
@@ -1019,13 +1045,40 @@ void sa2_sched_owe_frames(uint64_t n) {
     if (n >= 1 && n <= 16) g_frames_owed = n;
 }
 
+/* SA2_CLOCK_FOLLOWS_REAL (above): the boundary `next` the frame clock asks for, or the real time
+ * elapsed since the first boundary when that is later, at most kFollowCatchup periods past
+ * `next`; a later real time moves the base, so the excess is let go. */
+static uint64_t follow_real(uint64_t now, uint64_t next) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return next;
+    const uint64_t real_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (!g_follow_base_ns) {
+        g_follow_base_ns = real_ns;
+        g_follow_base_us = now;
+        return next;
+    }
+    uint64_t target = g_follow_base_us + (real_ns - g_follow_base_ns) / 1000ull;
+    const uint64_t cap = next + kFollowCatchup * g_frame_us;
+    if (target > cap) {
+        g_follow_dropped_us += target - cap;
+        g_follow_base_ns = real_ns;
+        g_follow_base_us = cap;
+        target = cap;
+    }
+    if (target <= next) return next;
+    g_follow_moves++;
+    g_follow_moved_us += target - next;
+    return target;
+}
+
 void sa2_sched_frame_boundary(void) {
     sa2_sched_init();
     const uint64_t periods = g_frames_owed;
     g_frames_owed = 1;
     if (!g_frame_us) { sa2_sched_yield("frame"); return; }
     const uint64_t now = sa2_virtual_us();
-    const uint64_t next = ((now / g_frame_us) + periods) * g_frame_us;
+    uint64_t next = ((now / g_frame_us) + periods) * g_frame_us;
+    if (g_follow_real) next = follow_real(now, next);
     g_frames++;
     /* One tick row per frame, taken before the hand-off: this is the
      * "per-tick state" two runs are compared on. */

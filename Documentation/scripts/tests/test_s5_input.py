@@ -1714,6 +1714,20 @@ def test_a_live_schedule_moves_past_its_slack_and_makes_up_only_the_slack(pace_d
     assert (js["virtual_s"], js["wall_s"], js["virtual_per_wall"]) == (0.066667, 0.25, 0.266668)
 
 
+def test_a_live_frame_catching_up_with_real_time_is_due_at_once(pace_driver):
+    """A live frame three periods past its predecessor (a game whose clock caught up with
+    real time, runtime/sa2_threads.c SA2_CLOCK_FOLLOWS_REAL) that is ready 46.667 ms before
+    its time is shown when ready: the schedule moves back by that much, counted with the
+    moves, and nothing waits. A file replay's schedule makes the same frame wait."""
+    frames = [(0, 100.0), (16667, 100.0167), (66667, 100.02)]
+    slots, js = pace_run(pace_driver, 0.06, frames)
+    assert slots[2] == (100.02, 100.066667, -0.046667)
+    assert (js["moves"], js["moved_s"], js["waited"]) == (1, 0.046667, 0)
+    slots, js = pace_run(pace_driver, -1, frames)
+    assert slots[2] == (100.066667, 100.066667, 0.0)
+    assert (js["moves"], js["waited"]) == (0, 1)
+
+
 # ---------------------------------------------------------------- the key sender
 
 DRIVER = r"""

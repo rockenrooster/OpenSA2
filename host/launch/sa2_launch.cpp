@@ -1584,9 +1584,13 @@ int launch(int argc, char** argv) {
         // And it leaves out a shader-constant write that changes no register
         // (SA2_REC_DROP_SAME_CONSTANTS): about two in five of a frame's calls in a stage, which the
         // player would only parse and compare. The selftest and the replays record every call.
+        // The game's virtual clock keeps up with real time (SA2_CLOCK_FOLLOWS_REAL,
+        // runtime/sa2_threads.c), so a game below 60 fps still gives the player a second of sound
+        // a second; the selftest and the replays keep the frame clock alone.
         for (const auto& [k, v] : {std::pair<const char*, const char*>{"SA2_REC_AUDIO_WATCH", "0"},
                                    {"SA2_REC_STORE_HASH_EVERY", "64"},
-                                   {"SA2_REC_DROP_SAME_CONSTANTS", "1"}})
+                                   {"SA2_REC_DROP_SAME_CONSTANTS", "1"},
+                                   {"SA2_CLOCK_FOLLOWS_REAL", "1"}})
             if (std::none_of(genv.kv.begin(), genv.kv.end(), [k = k](const auto& e) { return e.first == k; }))
                 genv.set(k, v);
     }

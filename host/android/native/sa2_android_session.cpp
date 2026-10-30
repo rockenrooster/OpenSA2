@@ -66,6 +66,9 @@
 //    kLiveStoreCheckEvery), not each one, byte by byte over the whole store, on the guest's path.
 //    It leaves out a shader-constant write that changes no register (SA2_REC_DROP_SAME_CONSTANTS=1),
 //    about two in five of a frame's calls.
+//  - The game's virtual clock keeps up with real time (SA2_CLOCK_FOLLOWS_REAL=1,
+//    runtime/sa2_threads.c), so a game below 60 fps still hands the player a second of sound a
+//    second: the sound no longer stutters when frames run long.
 //  - ADPF. Two APerformanceHint sessions (API 33, loaded with dlopen so API 29 still runs), each
 //    with a 16.67 ms target (SA2_ADPF_TARGET_US): the game's threads, from this process (Android
 //    14 accepts another process's threads of the same uid), told the game's CPU time per frame;
@@ -1011,6 +1014,7 @@ int play_game(const Args& a) {
     env_set(genv, "SA2_REC_AUDIO_WATCH", "0");
     env_set(genv, "SA2_REC_STORE_HASH_EVERY", "64");
     env_set(genv, "SA2_REC_DROP_SAME_CONSTANTS", "1");
+    env_set(genv, "SA2_CLOCK_FOLLOWS_REAL", "1");
     env_set(genv, "SA2_STALL_DUMP_MS", "3000");   // the runtime's stall watch (runtime/sa2_stall.h)
     // Full width (the header): the game's back buffer at the screen's size, unless the screen is no
     // wider than 4:3, where the game's 4:3 layout would be cut at the sides.

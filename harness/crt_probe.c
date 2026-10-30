@@ -3367,6 +3367,13 @@ int main(int argc, char **argv) {
          * hold it to. A record without the field reused no row. */
         if (sa2_sched_rows_reused())
             fprintf(out, "\"rows_reused\": %llu, ", (unsigned long long)sa2_sched_rows_reused());
+        /* SA2_CLOCK_FOLLOWS_REAL (runtime/sa2_threads.c): only a run whose clock it moved has
+         * the field, so every replay's record stays as it was. */
+        if (sa2_sched_follow_moves())
+            fprintf(out, "\"clock_follows_real\": {\"moves\": %llu, \"moved_ms\": %llu, \"let_go_ms\": %llu}, ",
+                    (unsigned long long)sa2_sched_follow_moves(),
+                    (unsigned long long)(sa2_sched_follow_moved_us() / 1000ull),
+                    (unsigned long long)(sa2_sched_follow_dropped_us() / 1000ull));
         fprintf(out, "\"live\": %d, \"switches\": %llu, \"time_advances\": %llu, "
                      "\"waits_without_end\": %llu, \"waits_that_blocked\": %llu, "
                      "\"virtual_budget_ms\": %llu, \"budget_hit\": %s, "

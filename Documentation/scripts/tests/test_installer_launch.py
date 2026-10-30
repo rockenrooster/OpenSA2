@@ -971,6 +971,7 @@ def test_play_turns_the_audio_store_watch_off_unless_game_env_names_it(release, 
     got = play("play")
     assert (got["SA2_REC_AUDIO_WATCH"], got["SA2_REC_STORE_HASH_EVERY"]) == ("0", "64")
     assert got["SA2_REC_DROP_SAME_CONSTANTS"] == "1"
+    assert got["SA2_CLOCK_FOLLOWS_REAL"] == "1"
     game_env = release["rel"] / "share" / "game.env"
     text = game_env.read_text()
     try:
@@ -983,7 +984,7 @@ def test_play_turns_the_audio_store_watch_off_unless_game_env_names_it(release, 
     assert p.returncode == 0, p.stdout + p.stderr
     got = json.loads((session / "game-args.runrec").read_text())["env"]
     assert "SA2_REC_AUDIO_WATCH" not in got and "SA2_REC_STORE_HASH_EVERY" not in got
-    assert "SA2_REC_DROP_SAME_CONSTANTS" not in got
+    assert "SA2_REC_DROP_SAME_CONSTANTS" not in got and "SA2_CLOCK_FOLLOWS_REAL" not in got
 
 
 def test_play_sets_the_full_width_answer_only_where_asked(release, tmp_path):

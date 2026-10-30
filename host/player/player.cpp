@@ -417,6 +417,9 @@ constexpr int kAudioQueueBound = int(Sa2Mixer::kRate) * 8 / 2;
 // the sound then plays behind its frames by (the "Sound" paragraph above).
 constexpr int kAudioLeadMs = 60;
 constexpr int kAudioFrameBytes = int(Sa2Mixer::kChannels * sizeof(float));
+// A live session's queue past this holds the sound late on its picture (Player::audio_block):
+// the lead and five frames, more than a steady game's queue reaches (about 92 ms at most).
+constexpr int kAudioTrimMs = 150;
 // The least time between two of a live session's service pumps (Player::on_idle).
 constexpr double kLivePumpGapS = 0.002;
 // A live session's reader services (Player::on_idle) between two reads of the clock while it
@@ -1447,6 +1450,8 @@ private:
     std::string audio_driver_, audio_failure_;
     uint64_t audio_records_ = 0, audio_blocks_ = 0, audio_bytes_queued_ = 0;
     uint64_t audio_dropped_ = 0, audio_drain_wait_ms_ = 0, audio_tail_wait_ms_ = 0;
+    uint64_t audio_trims_ = 0, audio_trimmed_frames_ = 0;   // Player::audio_block, live sessions only
+    std::vector<float> audio_trim_;
     int audio_queued_at_end_ = 0;
     // the device's lead, the sound before the first Present (the WAV's alone), the
     // queue's depth each time a block was queued, and SDL's requests (on_audio_request)
@@ -5089,11 +5094,35 @@ void Player::audio_block() {
             audio_depth_min_ = audio_depth_min_ < 0 ? queued : std::min(audio_depth_min_, queued);
             audio_depth_max_ = std::max(audio_depth_max_, queued);
         }
+        // A live session whose queue is past kAudioTrimMs plays its sound that much late on the
+        // picture: a game that caught up with real time (runtime/sa2_threads.c,
+        // SA2_CLOCK_FOLLOWS_REAL) has its frame shown at once (pace.h) and its sound queued with
+        // it, and nothing drains the excess. The block's head goes instead, at most a quarter of
+        // the block a frame, so the queue comes back within a few frames; a 1 ms fade-in hides
+        // the cut. The WAV, written above, keeps every sample.
+        const float* data = blk.data();
+        int put = bytes;
+        const int trim_at = int(Sa2Mixer::kRate) * kAudioTrimMs / 1000 * kAudioFrameBytes;
+        if (o_.explicit_live() && queued > trim_at && queued <= kAudioQueueBound) {
+            const size_t frames = blk.size() / Sa2Mixer::kChannels;
+            const size_t cut = std::min(size_t(queued - trim_at) / size_t(kAudioFrameBytes), frames / 4);
+            if (cut) {
+                audio_trim_.assign(blk.begin() + std::ptrdiff_t(cut * Sa2Mixer::kChannels), blk.end());
+                const size_t fade = std::min(size_t(Sa2Mixer::kRate) / 1000, frames - cut);
+                for (size_t i = 0; i < fade; i++)
+                    for (size_t c = 0; c < size_t(Sa2Mixer::kChannels); c++)
+                        audio_trim_[i * Sa2Mixer::kChannels + c] *= float(i) / float(fade);
+                data = audio_trim_.data();
+                put = int(audio_trim_.size() * sizeof(float));
+                audio_trims_++;
+                audio_trimmed_frames_ += cut;
+            }
+        }
         if (queued > kAudioQueueBound) {
             audio_dropped_++;
-        } else if (SDL_PutAudioStreamData(audio_stream_, blk.data(), bytes)) {
+        } else if (SDL_PutAudioStreamData(audio_stream_, data, put)) {
             audio_blocks_++;
-            audio_bytes_queued_ += uint64_t(bytes);
+            audio_bytes_queued_ += uint64_t(put);
         } else if (audio_failure_.empty()) {
             audio_failure_ = strf("SDL_PutAudioStreamData: %s", SDL_GetError());
         }
@@ -5178,13 +5207,16 @@ std::string Player::audio_json() const {
                   ", \"bytes_queued\": %" PRIu64 ", \"blocks_dropped\": %" PRIu64 ", \"queue_before_block\": %s, "
                   "\"requests\": %" PRIu64 ", \"shortfalls\": %" PRIu64 ", \"shortfall_bytes\": %" PRIu64
                   ", \"queue_bound_bytes\": %d, \"queued_at_end\": %d, \"drain_wait_ms\": %" PRIu64
-                  ", \"tail_wait_ms\": %" PRIu64 "}, ",
+                  ", \"tail_wait_ms\": %" PRIu64 "%s}, ",
                   audio_stream_ ? "true" : "false", jstr(audio_driver_).c_str(),
                   audio_failure_.empty() ? "null" : jstr(audio_failure_).c_str(), kAudioLeadMs,
                   audio_pre_first_samples_, audio_tail_samples_, audio_blocks_, audio_bytes_queued_, audio_dropped_,
                   depth.c_str(), audio_tap_.requests.load(), audio_tap_.shortfalls.load(),
                   audio_tap_.shortfall_bytes.load(), kAudioQueueBound, audio_queued_at_end_, audio_drain_wait_ms_,
-                  audio_tail_wait_ms_);
+                  audio_tail_wait_ms_,
+                  audio_trims_ ? strf(", \"trims\": %" PRIu64 ", \"trimmed_frames\": %" PRIu64 ", \"trim_at_ms\": %d",
+                                      audio_trims_, audio_trimmed_frames_, kAudioTrimMs).c_str()
+                               : "");
     }
     else
         s += "\"device\": null, ";

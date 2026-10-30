@@ -17,6 +17,14 @@
 // device's queue absorbs moves nothing, and after a longer one the sound keeps its lead
 // on the picture.
 //
+// A live frame whose virtual time is more than one and a half 60 Hz periods past its
+// predecessor's is a game catching up with real time (runtime/sa2_threads.c,
+// SA2_CLOCK_FOLLOWS_REAL, or several game ticks in one frame): it never waits. Were it to,
+// the game would wait on the pace pipe for it, that wait would be real time its clock
+// then caught up, and the next frame would be early again, a loop that held a game able to
+// draw 57 frames a second to 27 (2026-10-29). Such a frame moves t0 back so that it is due
+// at once, counted with the moves.
+//
 // What it counts, for the report's "pace":
 //   frames      paced frames
 //   waited      frames ready before their time, and the wait in all
@@ -62,8 +70,14 @@ public:
             t0_ += moved;
             moves_++;
             moved_s_ += moved;
+        } else if (slack_s_ >= 0.0 && frames_ > 0 && now < due && vus > last_vus_ &&
+                   double(vus - last_vus_) / 1e6 > 1.5 * kFrameS) {
+            moved = now - due;                       // a frame catching up: due at once
+            t0_ += moved;
+            moves_++;
+            moved_s_ -= moved;
         }
-        if (now < due) { waited_++; wait_s_ += due - now; }
+        if (now < due + moved) { waited_++; wait_s_ += due + moved - now; }
         return {due + moved, due, moved};
     }
 

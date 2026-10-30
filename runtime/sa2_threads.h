@@ -468,6 +468,12 @@ uint64_t sa2_timer_pulses_lost(void);        /* pulses nobody was waiting for */
  * never happened. */
 uint64_t sa2_sched_switches(void);
 uint64_t sa2_sched_time_advances(void);
+/* SA2_CLOCK_FOLLOWS_REAL (runtime/sa2_threads.c): frame boundaries that moved the virtual clock
+ * past the frame clock's to keep it up with real time, by how much in all, and the real time let
+ * go past the catch-up bound. */
+uint64_t sa2_sched_follow_moves(void);
+uint64_t sa2_sched_follow_moved_us(void);
+uint64_t sa2_sched_follow_dropped_us(void);
 uint64_t sa2_sched_deadlocks(void);              /* waits that had no possible end */
 uint64_t sa2_sched_slices(int idx);              /* times this thread got the token */
 uint64_t sa2_sched_guest_calls(int idx);
