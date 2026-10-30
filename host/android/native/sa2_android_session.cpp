@@ -1260,14 +1260,21 @@ int play_game(const Args& a) {
                                      "--end-fd", std::to_string(end_w),
                                      "--stage", "3", "--report", session + "/player-report.runrec",
                                      "--report-every", "600", "--input-path", input_fifo};
-    if (a.pace) args.push_back("--pace");
     // SA2_PLAY_SPEED=S (2 to 4, from game.env.extra), for measuring: the player paces frames S
     // times faster than the game's clock (--speed), so a game, relay, player and GPU that keep up
     // draw S x 60 frames a second, and the frame times show how far they are from it. The game
     // then runs S times too fast and there is no sound (the player's --audio needs --speed 1).
+    // SA2_PLAY_SPEED=max: no frame waits for its time at all (no --pace), so the game, which ticks
+    // once a frame, runs as fast as the game, relay, player and GPU can go: the frame rate is the
+    // device's ceiling. The relay still holds the game one frame ahead of the player at most.
     const std::string* speed = a.pace ? env_find(genv, "SA2_PLAY_SPEED") : nullptr;
-    const double s = speed ? std::strtod(speed->c_str(), nullptr) : 0.0;
-    if (s >= 2.0 && s <= 4.0) {
+    const bool uncapped = speed && *speed == "max";
+    if (a.pace && !uncapped) args.push_back("--pace");
+    const double s = speed && !uncapped ? std::strtod(speed->c_str(), nullptr) : 0.0;
+    if (uncapped) {
+        say("player: frames shown as soon as they are drawn, the game as fast as it goes, without sound "
+            "(SA2_PLAY_SPEED=max)");
+    } else if (s >= 2.0 && s <= 4.0) {
         args.push_back("--speed");
         args.push_back(*speed);
         say("player: frames paced at %g times the game's clock, without sound (SA2_PLAY_SPEED)", s);
