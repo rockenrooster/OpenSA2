@@ -188,6 +188,17 @@
  *                          2026-10-12). The counts file's "audio" "store_hash" says how many
  *                          closed and how many went without. Unset, 1 or anything else, every
  *                          such Unlock carries it: replays, the selftest, every receipt's run.
+ *   SA2_REC_DROP_SAME_CONSTANTS=1  a SetVertexShaderConstantF or SetPixelShaderConstantF whose
+ *                          every register already holds, in the stream, the value it writes is
+ *                          left out of the stream (same_constants_call): the player's device
+ *                          ends in the same state either way. In City Escape four in five
+ *                          vertex and two in three pixel constant writes are such, about
+ *                          3,200 of a frame's 8,000 calls (2026-10-29). Every register starts
+ *                          unknown, a device's creation or Reset forgets them all, and a state
+ *                          block (created, or begun) turns the dropping off for the run. The
+ *                          counts file's "same_constants" says how many were left out. A live
+ *                          session's play only (host/launch, host/android); unset or any other
+ *                          value, every call is recorded: replays, the selftest, every receipt's run.
  *   SA2_REC_PACE_FD=<n>    the read end of a live session's pace pipe, inherited as descriptor
  *                          n (host/launch/sa2_relay.h, "Pace"): after each frame's records are
  *                          written, the recorder reads one byte from it, so the game waits
@@ -733,6 +744,14 @@ static int g_au_watch = 1;
  * those of them that carry no store_hash because of it. */
 static uint32_t g_au_hash_every = 1;
 static uint64_t g_au_closes, g_au_hash_skipped;
+/* SA2_REC_DROP_SAME_CONSTANTS=1: the float constants each stage's records have carried (vertex 0,
+ * pixel 1), which of them are known, the calls left out, and whether a state block turned it off. */
+#define REC_CONST_REGS 256u
+static int g_drop_same;
+static uint32_t g_const_val[2][REC_CONST_REGS][4];
+static uint8_t g_const_known[2][REC_CONST_REGS];
+static int g_const_blocked;
+static uint64_t g_const_dropped;
 
 static uint32_t note_classes(void) { return g_audio_on ? N_ALL : N_COUNT; }
 
@@ -1843,6 +1862,8 @@ static void rec_init(void) {
     g_counts_path = getenv("SA2_REC_COUNTS");
     const char *aw = getenv("SA2_REC_AUDIO_WATCH");
     g_au_watch = !(aw && !strcmp(aw, "0"));
+    const char *dc = getenv("SA2_REC_DROP_SAME_CONSTANTS");
+    g_drop_same = dc && !strcmp(dc, "1");
     const char *pf = getenv("SA2_REC_PACE_FD");
     if (pf && *pf) {                                /* decimal digits only, 0 to 65535 */
         int n = 0;
@@ -2018,6 +2039,9 @@ static void write_counts(void) {
                "\"watched_at_exit\": %u, \"bytes_hashed\": %llu, \"changed\": %llu},\n",
             REC_WATCH_EVERY, (unsigned long long)g_watch_set, (unsigned long long)g_watch_checks,
             watched, (unsigned long long)g_watch_hashed, (unsigned long long)g_watch_changed);
+    fprintf(f, " \"same_constants\": {\"drop\": %s, \"dropped\": %llu, \"off_by_state_block\": %s},\n",
+            g_drop_same ? "true" : "false", (unsigned long long)g_const_dropped,
+            g_const_blocked ? "true" : "false");
     if (g_audio_on) {
         /* Per op: calls entered and returned, records written, and calls that answered
          * a failure (nothing to record). The store watch: Unlocks that set it, checks
@@ -2077,6 +2101,39 @@ static void rec_exit(void) {
 
 /* ------------------------------------------------------------ the thunk */
 
+/* SA2_REC_DROP_SAME_CONSTANTS=1: whether `c`, a call that answered, is a float constant write
+ * the stream need not carry, every register it writes holding that value in the records already
+ * (the header). A call that failed changes nothing and is recorded; one with notes is recorded
+ * for them. Device creation and Reset forget every register; a state block turns the dropping
+ * off, since its recording and its Apply move constants without these calls. */
+static int same_constants_call(const rec_call *c) {
+    if (!g_drop_same || g_const_blocked) return 0;
+    if ((c->t == T_D3D9 && c->slot == 16u) || (c->t == T_DEVICE && c->slot == 16u)) {
+        memset(g_const_known, 0, sizeof g_const_known);      /* CreateDevice, Reset */
+        return 0;
+    }
+    if (c->t == T_STATEBLOCK || (c->t == T_DEVICE && c->slot >= 59u && c->slot <= 61u)) {
+        g_const_blocked = 1;                                 /* Create/Begin/EndStateBlock */
+        return 0;
+    }
+    if (c->t != T_DEVICE || (c->slot != 94u && c->slot != 109u)) return 0;
+    if (c->argc < 3u || c->eax != 0u || c->nnotes) return 0;
+    const uint32_t start = c->a[0], src = c->a[1], n = c->a[2];
+    if (!n || n > 64u || start >= REC_CONST_REGS || n > REC_CONST_REGS - start) return 0;
+    uint32_t v[64][4];
+    if (sa2_peek(src, 16u * n, v) != SA2_OK) return 0;
+    const int stage = c->slot == 109u;
+    int same = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t *reg = g_const_val[stage][start + i];
+        if (!g_const_known[stage][start + i] || memcmp(reg, v[i], 16)) same = 0;
+        memcpy(reg, v[i], 16);
+        g_const_known[stage][start + i] = 1;
+    }
+    g_const_dropped += same;
+    return same;
+}
+
 static void *rec_thunk(void *s, uint32_t pc, void *m) {
     const uint32_t idx = (pc - SA2_D3D9_THUNK_BASE) / SA2_D3D9_THUNK_STRIDE;
     sa2_lifted_fn real = (idx < REC_THUNKS && g_real[idx]) ? g_real[idx] : g_real_any;
@@ -2132,6 +2189,7 @@ static void *rec_thunk(void *s, uint32_t pc, void *m) {
     /* A buffer's final Release gives its store back to the guest heap. */
     if (slot == 2u && (t == T_VERTEXBUFFER || t == T_INDEXBUFFER) && c->eax == 0u)
         watch_drop(obj_at(c->self));
+    if (same_constants_call(c)) return r;
     emit_call(c, 0);
 #ifdef REC_BREAK_POKE
     {

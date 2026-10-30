@@ -1581,8 +1581,12 @@ int launch(int argc, char** argv) {
         // (player.cpp, kLiveStoreCheckEvery), and the others skip a byte-at-a-time hash of the
         // whole store on the guest's serialized path. A game.env line sets it otherwise; the
         // selftest and the replays hash every one.
+        // And it leaves out a shader-constant write that changes no register
+        // (SA2_REC_DROP_SAME_CONSTANTS): about two in five of a frame's calls in a stage, which the
+        // player would only parse and compare. The selftest and the replays record every call.
         for (const auto& [k, v] : {std::pair<const char*, const char*>{"SA2_REC_AUDIO_WATCH", "0"},
-                                   {"SA2_REC_STORE_HASH_EVERY", "64"}})
+                                   {"SA2_REC_STORE_HASH_EVERY", "64"},
+                                   {"SA2_REC_DROP_SAME_CONSTANTS", "1"}})
             if (std::none_of(genv.kv.begin(), genv.kv.end(), [k = k](const auto& e) { return e.first == k; }))
                 genv.set(k, v);
     }
