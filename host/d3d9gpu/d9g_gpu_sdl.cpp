@@ -6,6 +6,7 @@
 // A whole clear waits (PendingClear) until a draw pass takes it as an attachment's load op or
 // anything else that touches its subresource encodes it first, so the call order still holds.
 #include "d9g.h"
+#include "d9g_interp_spirv.h"
 #include "d9g_props.h"
 #include "tweaks/tex-filter.h"
 
@@ -149,10 +150,18 @@ public:
                          "picture is blurred\n", tiny_prop ? "debug.sa2.tiny_mips=1" : "SA2_D3D9GPU_TINY_MIPS=1");
         const char* dump_prop = nullptr;
         dump_spirv_ = test_switch("SA2_D3D9GPU_DUMP_SPIRV", "debug.sa2.dump_spirv", &dump_prop);
+        // SA2_PLAYER_INTERP=1 (on Android also debug.sa2.interp=1): frame interpolation (Interp).
+        const char* interp_prop = nullptr;
+        interp_ = test_switch("SA2_PLAYER_INTERP", "debug.sa2.interp", &interp_prop);
+        if (interp_)
+            std::fprintf(stderr, "d3d9gpu: %s: a frame is made between every two the game draws and shown at its "
+                                 "Present, the drawn frame half a period later\n",
+                         interp_prop ? "debug.sa2.interp=1" : "SA2_PLAYER_INTERP=1");
     }
 
     ~SdlGpu() override {
         finish();
+        interp_release();
         for (auto& [id, t] : tex_) SDL_ReleaseGPUTexture(dev_, t.t);
         for (auto& [id, b] : buf_) SDL_ReleaseGPUBuffer(dev_, b.b);
         free_up_chunks();
@@ -843,8 +852,12 @@ public:
                 const FitRect dst = fit_rect(bw, bh, w, h, SDL_GetFloatProperty(wp, "sa2.picture_y", -1.0f),
                                              uint32_t(SDL_GetNumberProperty(wp, "sa2.picture_min_top", 0)));
                 const bool whole = dst.x == 0 && dst.y == 0 && dst.w == w && dst.h == h;
+                // Interpolating: the frame made between the last drawn frame and this one is shown
+                // now, and this one is kept for present_pending (Interp).
+                SDL_GPUTexture* shown = interp_ ? interp_make(cb, it->second.t, bw, bh, sdl_format(it->second.d.fmt))
+                                                : it->second.t;
                 SDL_GPUBlitInfo bi{};
-                bi.source = SDL_GPUBlitRegion{it->second.t, 0, 0, 0, 0, bw, bh};
+                bi.source = SDL_GPUBlitRegion{shown, 0, 0, 0, 0, bw, bh};
                 bi.destination = SDL_GPUBlitRegion{sw, 0, 0, dst.x, dst.y, dst.w, dst.h};
                 bi.load_op = whole ? SDL_GPU_LOADOP_DONT_CARE : SDL_GPU_LOADOP_CLEAR;
                 bi.clear_color = SDL_FColor{0.0f, 0.0f, 0.0f, 1.0f};
@@ -904,6 +917,26 @@ public:
         if (!SDL_SetGPUSwapchainParameters(dev_, w, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, m)) {
             err_ = std::string("SDL_SetGPUSwapchainParameters: ") + SDL_GetError();
             return false;
+        }
+        // Interpolation shows twice the game's frames, which only a display refreshing at about
+        // twice 60 Hz can: Android's compositor takes one buffer a refresh, so on the 60 Hz panel
+        // of a Moto One 5G Ace the second Present waited for the next and held the game to 30
+        // frames a second (2026-10-29). Below kInterpMinHz it is off, said once.
+        if (interp_) {
+            const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(w));
+            if (dm && dm->refresh_rate > 0.0f && dm->refresh_rate < kInterpMinHz) {
+                std::fprintf(stderr, "d3d9gpu: SA2_PLAYER_INTERP: the display refreshes at %.0f Hz, below %.0f: "
+                                     "frames are not interpolated\n", double(dm->refresh_rate), double(kInterpMinHz));
+                interp_ = false;
+            }
+        }
+        // The interpolation's second Present, which the player makes half a period after each
+        // one (host/player/player.cpp, SA2_PLAYER_INTERP): a function in the window's properties,
+        // as the player's present overlay is in the other direction.
+        if (interp_) {
+            const SDL_PropertiesID wp = SDL_GetWindowProperties(w);
+            SDL_SetPointerProperty(wp, "sa2.interp.present_pending", reinterpret_cast<void*>(&SdlGpu::present_pending_thunk));
+            SDL_SetPointerProperty(wp, "sa2.interp.context", this);
         }
         return true;
     }
@@ -1649,6 +1682,225 @@ private:
         return ok && no_error;
     }
 
+    // ------------------------------------------------------------ frame interpolation
+    //
+    // SA2_PLAYER_INTERP=1 (on Android also debug.sa2.interp=1): one frame made between every two the
+    // game draws, from the two pictures alone (host/d3d9gpu/interp_shaders.py has the passes and
+    // why): at a Present the back buffer is copied into the ring, its luma made at 1/scale, each
+    // 4 x 4 luma block's motion into the previous frame found, and the frame half way between them
+    // drawn and shown; the drawn frame is shown by present_pending, which the player calls half a
+    // period later (host/player/player.cpp). Every pass is on the render thread, in its command
+    // buffers. A device that cannot make the passes' targets shows each drawn frame as before.
+    static constexpr float kInterpMismatch = 0.08f;   // a block's mean luma difference past which it did not match
+    static constexpr float kInterpMinHz = 110.0f;     // the least refresh rate that shows every frame made
+
+    static int present_pending_thunk(void* self) { return static_cast<SdlGpu*>(self)->present_pending(); }
+
+    // The drawn frame the last Present kept, shown now: 1 shown, 0 nothing to show (or no surface
+    // to show it on), -1 an SDL failure (said once on stderr).
+    int present_pending() {
+        Interp& p = ip_;
+        const int slot = p.pending;
+        p.pending = -1;
+        if (slot < 0 || !win_ || surface_gone_ || poisoned_) return 0;
+        const SDL_PropertiesID wp = SDL_GetWindowProperties(win_);
+#ifdef __ANDROID__
+        if (!SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr)) return 0;
+#endif
+        SDL_GPUCommandBuffer* cb = SDL_AcquireGPUCommandBuffer(dev_);
+        if (!cb) return interp_fail("SDL_AcquireGPUCommandBuffer");
+        SDL_GPUTexture* sw = nullptr;
+        Uint32 w = 0, h = 0;
+        if (!SDL_WaitAndAcquireGPUSwapchainTexture(cb, win_, &sw, &w, &h)) {
+            SDL_CancelGPUCommandBuffer(cb);
+            return 0;
+        }
+        if (sw) {
+            const FitRect dst = fit_rect(p.w, p.h, w, h, SDL_GetFloatProperty(wp, "sa2.picture_y", -1.0f),
+                                         uint32_t(SDL_GetNumberProperty(wp, "sa2.picture_min_top", 0)));
+            const bool whole = dst.x == 0 && dst.y == 0 && dst.w == w && dst.h == h;
+            SDL_GPUBlitInfo bi{};
+            bi.source = SDL_GPUBlitRegion{p.frame[slot], 0, 0, 0, 0, p.w, p.h};
+            bi.destination = SDL_GPUBlitRegion{sw, 0, 0, dst.x, dst.y, dst.w, dst.h};
+            bi.load_op = whole ? SDL_GPU_LOADOP_DONT_CARE : SDL_GPU_LOADOP_CLEAR;
+            bi.clear_color = SDL_FColor{0.0f, 0.0f, 0.0f, 1.0f};
+            bi.flip_mode = SDL_FLIP_NONE;
+            bi.filter = (dst.w == p.w && dst.h == p.h) ? SDL_GPU_FILTER_NEAREST : SDL_GPU_FILTER_LINEAR;
+            SDL_BlitGPUTexture(cb, &bi);
+            using PresentOverlay = void (*)(void*, SDL_GPUDevice*, SDL_GPUCommandBuffer*, SDL_GPUTexture*, Uint32,
+                                            Uint32, SDL_GPUTexture*, Uint32, Uint32);
+            if (void* overlay = SDL_GetPointerProperty(wp, "sa2.present_overlay", nullptr))
+                reinterpret_cast<PresentOverlay>(overlay)(SDL_GetPointerProperty(wp, "sa2.present_overlay.context", nullptr),
+                    dev_, cb, p.frame[slot], p.w, p.h, sw, w, h);
+        }
+        if (!SDL_SubmitGPUCommandBuffer(cb)) return interp_fail("SDL_SubmitGPUCommandBuffer");
+        SDL_ClearError();
+        if (!sw) return 0;
+        p.pending_shown++;
+        return 1;
+    }
+
+    int interp_fail(const char* what) {
+        if (!ip_.failed) std::fprintf(stderr, "d3d9gpu: frame interpolation: %s: %s; drawn frames are shown alone from now on\n",
+                                      what, SDL_GetError());
+        ip_.failed = true;
+        ip_.pending = -1;
+        return -1;
+    }
+
+    // The passes' shaders, pipelines and samplers (once), and their targets at this back buffer's
+    // size and format (again when either changes). False: interpolation is off for the session.
+    bool interp_ready(uint32_t bw, uint32_t bh, SDL_GPUTextureFormat fmt) {
+        Interp& p = ip_;
+        if (p.failed) return false;
+        if (!p.vs) {
+            auto shader = [&](const uint32_t* code, size_t bytes, SDL_GPUShaderStage stage, Uint32 samplers) {
+                SDL_GPUShaderCreateInfo ci{};
+                ci.code = reinterpret_cast<const Uint8*>(code);
+                ci.code_size = bytes;
+                ci.entrypoint = "main";
+                ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+                ci.stage = stage;
+                ci.num_samplers = samplers;
+                ci.num_uniform_buffers = stage == SDL_GPU_SHADERSTAGE_FRAGMENT ? 1 : 0;
+                return SDL_CreateGPUShader(dev_, &ci);
+            };
+            using namespace sa2_interp_spirv;
+            p.vs = shader(kVertex, sizeof kVertex, SDL_GPU_SHADERSTAGE_VERTEX, 0);
+            p.fs[0] = shader(kLuma, sizeof kLuma, SDL_GPU_SHADERSTAGE_FRAGMENT, 1);
+            p.fs[1] = shader(kMotion, sizeof kMotion, SDL_GPU_SHADERSTAGE_FRAGMENT, 2);
+            p.fs[2] = shader(kWarp, sizeof kWarp, SDL_GPU_SHADERSTAGE_FRAGMENT, 3);
+            if (!p.vs || !p.fs[0] || !p.fs[1] || !p.fs[2]) return interp_fail("SDL_CreateGPUShader") == 0;
+            SDL_GPUSamplerCreateInfo si{};
+            si.min_filter = si.mag_filter = SDL_GPU_FILTER_LINEAR;
+            si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+            si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+            p.linear = SDL_CreateGPUSampler(dev_, &si);
+            si.min_filter = si.mag_filter = SDL_GPU_FILTER_NEAREST;
+            p.nearest = SDL_CreateGPUSampler(dev_, &si);
+            if (!p.linear || !p.nearest) return interp_fail("SDL_CreateGPUSampler") == 0;
+        }
+        if (p.frame[0] && p.w == bw && p.h == bh && p.fmt == fmt) return true;
+        interp_release_targets();
+        const SDL_GPUTextureUsageFlags rt = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        for (SDL_GPUTextureFormat f : {fmt, SDL_GPU_TEXTUREFORMAT_R8_UNORM, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT})
+            if (!SDL_GPUTextureSupportsFormat(dev_, f, SDL_GPU_TEXTURETYPE_2D, rt)) return interp_fail("a target format") == 0;
+        p.w = bw; p.h = bh; p.fmt = fmt;
+        p.scale = bw >= 1800 ? 8 : bw >= 900 ? 4 : 2;
+        p.lw = (bw + p.scale - 1) / p.scale; p.lh = (bh + p.scale - 1) / p.scale;
+        const uint32_t b = uint32_t(sa2_interp_spirv::kBlock);
+        p.mw = (p.lw + b - 1) / b; p.mh = (p.lh + b - 1) / b;
+        auto texture = [&](SDL_GPUTextureFormat f, uint32_t w, uint32_t h) {
+            SDL_GPUTextureCreateInfo ci{};
+            ci.type = SDL_GPU_TEXTURETYPE_2D; ci.format = f; ci.usage = rt;
+            ci.width = w; ci.height = h; ci.layer_count_or_depth = 1; ci.num_levels = 1;
+            ci.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            return SDL_CreateGPUTexture(dev_, &ci);
+        };
+        for (int i = 0; i < 2; i++) {
+            p.frame[i] = texture(fmt, bw, bh);
+            p.luma[i] = texture(SDL_GPU_TEXTUREFORMAT_R8_UNORM, p.lw, p.lh);
+        }
+        p.motion = texture(SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, p.mw, p.mh);
+        p.made = texture(fmt, bw, bh);
+        if (!p.frame[0] || !p.frame[1] || !p.luma[0] || !p.luma[1] || !p.motion || !p.made)
+            return interp_fail("SDL_CreateGPUTexture") == 0;
+        const SDL_GPUTextureFormat target[3] = {SDL_GPU_TEXTUREFORMAT_R8_UNORM, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, fmt};
+        for (int i = 0; i < 3; i++) {
+            if (p.pipe[i] && p.pipe_fmt[i] == target[i]) continue;
+            if (p.pipe[i]) SDL_ReleaseGPUGraphicsPipeline(dev_, p.pipe[i]);
+            SDL_GPUColorTargetDescription ct{};
+            ct.format = target[i];
+            SDL_GPUGraphicsPipelineCreateInfo pi{};
+            pi.vertex_shader = p.vs;
+            pi.fragment_shader = p.fs[i];
+            pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+            pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+            pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+            pi.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            pi.target_info.color_target_descriptions = &ct;
+            pi.target_info.num_color_targets = 1;
+            p.pipe[i] = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+            p.pipe_fmt[i] = target[i];
+            if (!p.pipe[i]) return interp_fail("SDL_CreateGPUGraphicsPipeline") == 0;
+        }
+        p.have_prev = false;
+        p.pending = -1;
+        return true;
+    }
+
+    // One fullscreen pass of pipeline `which` into `target`.
+    bool interp_pass(SDL_GPUCommandBuffer* cb, SDL_GPUTexture* target, int which,
+                     std::initializer_list<SDL_GPUTextureSamplerBinding> tex, const void* u, Uint32 n) {
+        SDL_GPUColorTargetInfo ct{};
+        ct.texture = target;
+        ct.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        ct.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPURenderPass* rp = SDL_BeginGPURenderPass(cb, &ct, 1, nullptr);
+        if (!rp) return interp_fail("SDL_BeginGPURenderPass") == 0;
+        SDL_BindGPUGraphicsPipeline(rp, ip_.pipe[which]);
+        SDL_BindGPUFragmentSamplers(rp, 0, tex.begin(), Uint32(tex.size()));
+        SDL_PushGPUFragmentUniformData(cb, 0, u, n);
+        SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
+        SDL_EndGPURenderPass(rp);
+        return true;
+    }
+
+    // At a Present (present(), its swapchain texture acquired): the back buffer `bb` into the ring,
+    // and the texture to show now: the frame made between the last drawn frame and this one, or
+    // `bb` itself at the first Present or when the passes cannot run.
+    SDL_GPUTexture* interp_make(SDL_GPUCommandBuffer* cb, SDL_GPUTexture* bb, uint32_t bw, uint32_t bh,
+                                SDL_GPUTextureFormat fmt) {
+        Interp& p = ip_;
+        p.pending = -1;
+        if (!interp_ready(bw, bh, fmt)) return bb;
+        const int cur = p.cur, prev = cur ^ 1;
+        SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cb);
+        if (!cp) { interp_fail("SDL_BeginGPUCopyPass"); return bb; }
+        SDL_GPUTextureLocation from{bb, 0, 0, 0, 0, 0}, to{p.frame[cur], 0, 0, 0, 0, 0};
+        SDL_CopyGPUTextureToTexture(cp, &from, &to, bw, bh, 1, false);
+        SDL_EndGPUCopyPass(cp);
+        const float luma_u[8] = {1.0f / float(bw), 1.0f / float(bh), 0, 0, float(p.scale), 0, 0, 0};
+        if (!interp_pass(cb, p.luma[cur], 0, {{p.frame[cur], p.linear}}, luma_u, sizeof luma_u)) return bb;
+        SDL_GPUTexture* shown = bb;
+        if (p.have_prev) {
+            const float motion_u[4] = {float(p.lw), float(p.lh), float(p.mw), float(p.mh)};
+            const float warp_u[4] = {float(p.scale) / float(bw), float(p.scale) / float(bh), kInterpMismatch, 0};
+            if (!interp_pass(cb, p.motion, 1, {{p.luma[cur], p.nearest}, {p.luma[prev], p.nearest}}, motion_u,
+                             sizeof motion_u) ||
+                !interp_pass(cb, p.made, 2, {{p.frame[prev], p.linear}, {p.frame[cur], p.linear}, {p.motion, p.linear}},
+                             warp_u, sizeof warp_u))
+                return bb;
+            shown = p.made;
+            p.pending = cur;
+            p.made_frames++;
+        }
+        p.cur = prev;
+        p.have_prev = true;
+        return shown;
+    }
+
+    void interp_release_targets() {
+        Interp& p = ip_;
+        for (SDL_GPUTexture** t : {&p.frame[0], &p.frame[1], &p.luma[0], &p.luma[1], &p.motion, &p.made})
+            if (*t) { SDL_ReleaseGPUTexture(dev_, *t); *t = nullptr; }
+    }
+
+    void interp_release() {
+        Interp& p = ip_;
+        interp_release_targets();
+        for (SDL_GPUGraphicsPipeline*& g : p.pipe) if (g) { SDL_ReleaseGPUGraphicsPipeline(dev_, g); g = nullptr; }
+        for (SDL_GPUShader*& s : p.fs) if (s) { SDL_ReleaseGPUShader(dev_, s); s = nullptr; }
+        if (p.vs) { SDL_ReleaseGPUShader(dev_, p.vs); p.vs = nullptr; }
+        if (p.linear) { SDL_ReleaseGPUSampler(dev_, p.linear); p.linear = nullptr; }
+        if (p.nearest) { SDL_ReleaseGPUSampler(dev_, p.nearest); p.nearest = nullptr; }
+        if (win_) {
+            const SDL_PropertiesID wp = SDL_GetWindowProperties(win_);
+            SDL_ClearProperty(wp, "sa2.interp.present_pending");
+            SDL_ClearProperty(wp, "sa2.interp.context");
+        }
+    }
+
     SDL_GPUDevice* dev_;
     SDL_Window* win_ = nullptr;
     std::unordered_map<uint32_t, Tex> tex_;
@@ -1673,6 +1925,26 @@ private:
     bool flat_ps_ = false;           // the measuring switch: kFlatPixelShader for every pixel shader
     bool tiny_mips_ = false;         // the measuring switch: every sampler at its texture's smallest level
     bool dump_spirv_ = false;        // each SPIR-V module SDL is given, into SA2_PLAY_OUT
+    bool interp_ = false;            // SA2_PLAYER_INTERP: frame interpolation (Interp)
+    struct Interp {
+        SDL_GPUTexture* frame[2]{};      // the last two drawn frames, copies of the back buffer
+        SDL_GPUTexture* luma[2]{};       // their luma at 1/scale
+        SDL_GPUTexture* motion = nullptr;
+        SDL_GPUTexture* made = nullptr;  // the frame between them
+        SDL_GPUShader* vs = nullptr;
+        SDL_GPUShader* fs[3]{};          // luma, motion, warp
+        SDL_GPUGraphicsPipeline* pipe[3]{};
+        SDL_GPUTextureFormat pipe_fmt[3]{};
+        SDL_GPUSampler* linear = nullptr;
+        SDL_GPUSampler* nearest = nullptr;
+        SDL_GPUTextureFormat fmt = SDL_GPU_TEXTUREFORMAT_INVALID;
+        uint32_t w = 0, h = 0, lw = 0, lh = 0, mw = 0, mh = 0, scale = 4;
+        int cur = 0;                     // the ring slot the next drawn frame goes to
+        bool have_prev = false;
+        int pending = -1;                // the slot present_pending shows, or -1
+        bool failed = false;
+        uint64_t made_frames = 0, pending_shown = 0;
+    } ip_;
     uint64_t presents_ = 0;          // present() calls (the surface-lost fault's frames)
     SDL_GPUCopyPass* copy_ = nullptr;
     // The open draw pass (open_pass, flush_pass): its attachments, and its draws' commands with

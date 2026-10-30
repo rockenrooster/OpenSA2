@@ -935,7 +935,12 @@ Sa2ReadStatus Sa2StreamReader::raw_live() {
         pollfd p[2]{{video_fd_, POLLIN, 0}, {cancel_fd_, POLLIN, 0}};
         timespec a{}, b{};
         clock_gettime(CLOCK_MONOTONIC, &a);
-        const int rc = ::poll(p, 2, idle_ms_);
+        int slice = idle_ms_;
+        if (wake_at_ > 0) {                    // set_wake_at: the service runs by then
+            const double left = wake_at_ - (double(a.tv_sec) + double(a.tv_nsec) * 1e-9);
+            slice = left <= 0 ? 0 : std::min(idle_ms_, int(left * 1000.0) + 1);
+        }
+        const int rc = ::poll(p, 2, slice);
         clock_gettime(CLOCK_MONOTONIC, &b);
         cancel_services_ = 0;                  // the next service looks at the cancellation
         ++idle_waits_;

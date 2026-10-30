@@ -296,7 +296,7 @@ struct Args {
 // where the player runs, and are taken out of the game's.
 bool player_setting(const std::string& k) {
     return k == "SA2_PLAYER_PROF" || k == "SA2_PLAYER_PROF_OUT" || k == "SA2_PLAYER_PICTURE_Y" || k == "SA2_PAD_MAP" ||
-           k.compare(0, 10, "SA2_TOUCH_") == 0;
+           k == "SA2_PLAYER_INTERP" || k.compare(0, 10, "SA2_TOUCH_") == 0;
 }
 
 // The first line of `path` that holds `needle`, said after `prefix` once it is there, while the

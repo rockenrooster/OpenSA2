@@ -1452,6 +1452,16 @@ private:
     uint64_t audio_dropped_ = 0, audio_drain_wait_ms_ = 0, audio_tail_wait_ms_ = 0;
     uint64_t audio_trims_ = 0, audio_trimmed_frames_ = 0;   // Player::audio_block, live sessions only
     std::vector<float> audio_trim_;
+    // Frame interpolation (SA2_PLAYER_INTERP, d3d9gpu's window property "sa2.interp.present_pending"):
+    // the Present shows the frame made between the last drawn frame and this one, and the drawn
+    // frame is shown half a period later (interp_show_drawn).
+    void interp_show_drawn(bool at_next_present);
+    int (*interp_present_)(void*) = nullptr;
+    void* interp_ctx_ = nullptr;
+    bool interp_looked_ = false, interp_pending_ = false;
+    double interp_due_ = 0, interp_late_max_ = 0;
+    uint32_t interp_checks_ = 0;
+    uint64_t interp_waits_seen_ = 0, interp_drawn_ = 0, interp_late_ = 0, interp_at_next_ = 0;
     int audio_queued_at_end_ = 0;
     // the device's lead, the sound before the first Present (the WAV's alone), the
     // queue's depth each time a block was queued, and SDL's requests (on_audio_request)
@@ -4200,6 +4210,15 @@ void Player::on_idle() {
     const sa2prof::ZoneScope zone(sa2prof::kZoneIdle);
     ++service_calls_;
     if (!win_) return;
+    // The drawn frame an interpolating Present kept, at its time: the clock read after every wait
+    // of the reader (whose poll ends by then: set_wake_at) and every 16th service between.
+    if (interp_pending_) {
+        const uint64_t waits = rd_.idle_waits();
+        if (waits != interp_waits_seen_ || (++interp_checks_ & 15u) == 0) {
+            interp_waits_seen_ = waits;
+            if (now_s() >= interp_due_) interp_show_drawn(false);
+        }
+    }
     // A live session's reader calls this for every record and every read, several times
     // a record (tens of thousands a frame in Metal Harbor); an SDL pump each time (167
     // million in a 77 s session) held the player to 0.81 of real time on Metal Harbor's
@@ -4227,12 +4246,27 @@ void Player::pace_until(double target) {
         pump_events();
         service_pads();
         if (stop_) return;
-        const double wait = target - now_s();
+        const double now = now_s();
+        if (interp_pending_ && now >= interp_due_) interp_show_drawn(false);
+        const double wait = target - now;
         if (wait <= 0) return;
-        const double slice = std::min(wait, 0.010);
+        double slice = std::min(wait, 0.010);
+        if (interp_pending_) slice = std::max(0.0, std::min(slice, interp_due_ - now));
         timespec ts{0, long(slice * 1e9)};
         nanosleep(&ts, nullptr);
     }
+}
+
+// The drawn frame an interpolating Present kept (d3d9gpu's present_pending), with its row:
+// at its time, or at the next Present when that came first (`at_next_present`).
+void Player::interp_show_drawn(bool at_next_present) {
+    interp_pending_ = false;
+    rd_.set_wake_at(0);
+    const double late = now_s() - interp_due_;
+    if (late > 0.002) { interp_late_++; interp_late_max_ = std::max(interp_late_max_, late); }
+    interp_at_next_ += at_next_present;
+    sa2prof::frame(frame_);
+    if (interp_present_(interp_ctx_) > 0) interp_drawn_++;
 }
 
 // A Present and its FRAME record: the stream's checks, in both modes; then,
@@ -4246,7 +4280,14 @@ void Player::do_present(const Sa2Record* fr) {
         stop_ = true; stop_reason_ = "diagnostic frame count overflow"; return;
     }
     frame_++;
-    sa2prof::frame(frame_);
+    if (!interp_looked_ && win_ && dev_) {
+        interp_looked_ = true;
+        const SDL_PropertiesID wp = SDL_GetWindowProperties(win_);
+        interp_present_ = reinterpret_cast<int (*)(void*)>(SDL_GetPointerProperty(wp, "sa2.interp.present_pending", nullptr));
+        interp_ctx_ = SDL_GetPointerProperty(wp, "sa2.interp.context", nullptr);
+    }
+    // Interpolating, a frame's rows are its two Presents' (below and interp_show_drawn).
+    if (!interp_present_) sa2prof::frame(frame_);
     const uint64_t vus = fr ? fr->virtual_us : last_vus_ + 16666u;
     if (!fr) {
         missing_frame_records_++;
@@ -4266,6 +4307,7 @@ void Player::do_present(const Sa2Record* fr) {
     }
     if (host()) {
         readback_frame(vus, fr);
+        if (interp_pending_) interp_show_drawn(true);   // the last frame's, its time passed while this one was drawn
         Sa2Pace::Slot slot{};
         double ready = 0;
         if (pace_) {
@@ -4290,7 +4332,16 @@ void Player::do_present(const Sa2Record* fr) {
         double call_s = -1;
         const bool call_ok = o_.present_log.empty() || checked_monotonic_s(&call_s);
         const double at = o_.present_log.empty() || !call_ok ? now_s() : call_s;
+        if (interp_present_) sa2prof::frame(frame_);
         const HRESULT hr = dev_->Present(nullptr, nullptr, nullptr, nullptr);
+        // Interpolating: the Present showed the frame between, and this one is shown half a 60 Hz
+        // period after its slot, by the service (on_idle, pace_until) or at the next Present at
+        // the latest; the reader's wait for the game ends by then (set_wake_at).
+        if (interp_present_ && SUCCEEDED(hr)) {
+            interp_pending_ = true;
+            interp_due_ = (pace_ ? std::max(slot.target, at) : at) + 0.5 / 60.0 / std::max(1.0, o_.speed);
+            rd_.set_wake_at(interp_due_);
+        }
         double returned_s = -1;
         const bool returned_ok = o_.present_log.empty() || checked_monotonic_s(&returned_s);
         if (!o_.synthetic_keys.empty() && frame_ == 1 && SUCCEEDED(hr) && call_ok && returned_ok) {
@@ -5803,6 +5854,10 @@ bool Player::write_report(bool complete) {
     if (o_.pace)
         s += "  \"pace\": " + (pace_ ? pace_->json() : std::string("null")) + ",\n  \"pace_log\": " +
              (o_.pace_log.empty() ? std::string("null") : jstr(o_.pace_log)) + ",\n";
+    if (interp_present_)
+        s += strf("  \"interpolation\": {\"drawn_frames_shown\": %" PRIu64 ", \"late_over_2ms\": %" PRIu64
+                  ", \"late_max_ms\": %.3f, \"shown_at_next_present\": %" PRIu64 "},\n",
+                  interp_drawn_, interp_late_, interp_late_max_ * 1e3, interp_at_next_);
     if (o_.stats_only)
         s += "  \"stats_only_leaves_out\": [\"device creation: the window, DXVK and CreateDevice\", "
              "\"host answers: a host call that fails, and the objects a failed one leaves unmade\", "

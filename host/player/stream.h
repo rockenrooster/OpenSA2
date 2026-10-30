@@ -203,6 +203,10 @@ public:
     void set_idle(void (*hook)(void*), void* arg, int slice_ms) {
         idle_hook_ = hook; idle_arg_ = arg; idle_ms_ = slice_ms;
     }
+    // A live descriptor's wait ends by `mono_s` (CLOCK_MONOTONIC seconds) at the latest, so the
+    // service runs then: the player's next interpolated Present (player.cpp, SA2_PLAYER_INTERP).
+    // 0: the slice alone, as before.
+    void set_wake_at(double mono_s) { wake_at_ = mono_s; }
     bool live() const { return live_; }
     uint64_t idle_waits() const { return idle_waits_; }
     uint64_t idle_slices() const { return idle_slices_; }
@@ -264,6 +268,7 @@ private:
     void (*idle_hook_)(void*) = nullptr;
     void* idle_arg_ = nullptr;
     int idle_ms_ = 20;
+    double wake_at_ = 0;                 // set_wake_at
     uint64_t idle_waits_ = 0, idle_slices_ = 0;
     double idle_s_ = 0;
     Sha256 sha_;
